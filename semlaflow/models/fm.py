@@ -155,7 +155,10 @@ class Integrator:
         noise[times + step_size < 1.0] = self.cat_noise_level
 
         # Off-diagonal step probs
-        mult = ((1 + ((2 * noise) * (n_categories - 1) * times)) / (1 - times))
+        # Note that there was a small bug in the original impl here, where mult was defined as:
+        # mult = ((1 + ((2 * noise) * (n_categories - 1) * times)) / (1 - times))
+        # In practice the original code was slightly worse than the fixed vesion, but we leave the correct version below
+        mult = ((1 + noise + (noise * (n_categories - 1) * times)) / (1 - times))
         first_term = step_size * mult * pred_dist
         second_term = step_size * noise * pred_probs_curr
         step_probs = (first_term + second_term).clamp(max=1.0)
