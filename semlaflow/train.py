@@ -50,7 +50,10 @@ DEFAULT_COORD_NOISE_STD_DEV = 0.2
 DEFAULT_TYPE_DIST_TEMP = 1.0
 DEFAULT_TIME_ALPHA = 2.0
 DEFAULT_TIME_BETA = 1.0
-DEFAULT_OPTIMAL_TRANSPORT = "equivariant"
+DEFAULT_OPTIMAL_TRANSPORT = "none"
+DEFAULT_COUPLING = "hungarian"
+DEFAULT_KABSCH_ALIGN = True
+DEFAULT_SINKHORN_N_ITERS = 100
 
 
 def build_model(args, dm, vocab):
@@ -240,19 +243,16 @@ def build_dm(args, vocab):
 
     scale_ot = False
     batch_ot = False
-    equivariant_ot = False
 
     if args.optimal_transport == "batch":
         batch_ot = True
-    elif args.optimal_transport == "equivariant":
-        equivariant_ot = True
     elif args.optimal_transport == "scale":
         scale_ot = True
-        equivariant_ot = True
     elif args.optimal_transport not in ["None", "none", None]:
         raise ValueError(
             f"Unknown value for optimal_transport '{args.optimal_transport}'. "
-            + "Acceted values: `batch`, `equivariant` and `scale`."
+            + "Accepted values: `none`, `batch` and `scale`. "
+            + "(per-atom coupling is controlled separately via --coupling / --kabsch_align)"
         )
 
     # train_fixed_time = 0.5 if args.distill else None
@@ -276,7 +276,9 @@ def build_dm(args, vocab):
         bond_interpolation=categorical_interpolation,
         coord_noise_std=args.coord_noise_std_dev,
         type_dist_temp=args.type_dist_temp,
-        equivariant_ot=equivariant_ot,
+        coupling=args.coupling,
+        kabsch_align=args.kabsch_align,
+        sinkhorn_n_iters=args.sinkhorn_n_iters,
         batch_ot=batch_ot,
         time_alpha=args.time_alpha,
         time_beta=args.time_beta,
@@ -287,7 +289,7 @@ def build_dm(args, vocab):
         coord_interpolation="linear",
         type_interpolation=categorical_interpolation,
         bond_interpolation=categorical_interpolation,
-        equivariant_ot=False,
+        coupling="none",
         batch_ot=False,
         fixed_time=0.9,
     )
@@ -417,6 +419,11 @@ if __name__ == "__main__":
     parser.add_argument("--time_alpha", type=float, default=DEFAULT_TIME_ALPHA)
     parser.add_argument("--time_beta", type=float, default=DEFAULT_TIME_BETA)
     parser.add_argument("--optimal_transport", type=str, default=DEFAULT_OPTIMAL_TRANSPORT)
+    parser.add_argument("--coupling", type=str, default=DEFAULT_COUPLING, choices=["none", "hungarian", "sinkhorn"])
+    parser.add_argument(
+        "--kabsch_align", action=argparse.BooleanOptionalAction, default=DEFAULT_KABSCH_ALIGN
+    )
+    parser.add_argument("--sinkhorn_n_iters", type=int, default=DEFAULT_SINKHORN_N_ITERS)
 
     parser.set_defaults(
         trial_run=False,

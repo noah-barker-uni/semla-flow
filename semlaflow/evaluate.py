@@ -163,7 +163,7 @@ def build_dm(args, hparams, vocab):
         coord_interpolation="linear",
         type_interpolation=hparams["val-type-interpolation"],
         bond_interpolation=hparams["val-bond-interpolation"],
-        equivariant_ot=False,
+        coupling="none",
         batch_ot=False,
     )
     dm = GeometricInterpolantDM(

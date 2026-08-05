@@ -4,6 +4,7 @@
 datasets/
 wandb/
 output/
+venv/
 
 # Editors
 .vscode/

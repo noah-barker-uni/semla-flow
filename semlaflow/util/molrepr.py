@@ -545,6 +545,57 @@ class GeometricMol(SmolMol):
         )
         return mol_copy
 
+    def soft_permute(self, P: _T) -> GeometricMol:
+        """Soft-permute atom order using a doubly-stochastic assignment matrix (eg. from sinkhorn).
+
+        Unlike permute(), which does a hard reindex, this mixes each new atom slot i as a convex
+        combination of the existing atoms weighted by P[i, :]. Requires atomics and bond_types to
+        already be distributions (one-hot or soft) rather than class indices, and requires bonds
+        to be fully dense (every ordered atom pair present) -- both of which always hold for a
+        freshly-sampled prior/noise molecule, which is the only place this is intended to be used.
+        """
+
+        n = self.seq_length
+
+        if P.size(0) != n or P.size(1) != n:
+            raise ValueError(f"P must have shape ({n}, {n}), got {tuple(P.shape)}.")
+
+        canonical_bond_indices = torch.ones((n, n)).nonzero()
+        if self.bond_indices.size(0) != n * n or not torch.equal(self.bond_indices.cpu(), canonical_bond_indices):
+            raise ValueError(
+                "soft_permute requires a fully dense, canonically-ordered bond list "
+                "(as produced by GeometricNoiseSampler.sample_molecule)."
+            )
+
+        if len(self.atomics.size()) != 2:
+            raise ValueError("soft_permute requires atomics to be a distribution, not class indices.")
+
+        if len(self.bond_types.size()) != 2:
+            raise ValueError("soft_permute requires bond_types to be a distribution, not class indices.")
+
+        P = P.to(self.coords.dtype)
+
+        coords = P @ self.coords
+        atomics = P @ self.atomics
+
+        # Reshape the raw per-direction bond_types into [n, n, n_bond_types] directly -- NOT via the
+        # `adjacency` property, which (for a fully dense edge list) ends up transposing rather than
+        # symmetrising. Mix both node axes by P: new_adj = P @ raw_adj @ P.T per channel.
+        raw_adj = self.bond_types.view(n, n, -1)
+        adj = torch.einsum("ij,jkc,lk->ilc", P, raw_adj, P)
+
+        bond_indices = canonical_bond_indices
+        bond_types = adj[bond_indices[:, 0], bond_indices[:, 1]]
+
+        # Prior charges are always all-zero (GeometricNoiseSampler never sets them), so this mix
+        # is a no-op in practice; kept general in case that changes.
+        charges = torch.round(P @ self.charges.float()).long()
+
+        mol_copy = self._copy_with(
+            coords=coords, atomics=atomics, bond_indices=bond_indices, bond_types=bond_types, charges=charges
+        )
+        return mol_copy
+
     # *** Geometric Specific Methods ***
 
     def zero_com(self) -> GeometricMol:

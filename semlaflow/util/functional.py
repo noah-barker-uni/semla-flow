@@ -457,6 +457,44 @@ def inter_distances(coords1, coords2, sqrd=False, eps=1e-6):
     return torch.sqrt(sqrd_dists + eps)
 
 
+def sinkhorn(cost_matrix: torch.Tensor, eps: float, n_iters: int = 100) -> torch.Tensor:
+    """Entropic-regularised soft assignment between two equally-sized point sets.
+
+    Solves for the doubly-stochastic matrix P (rows and cols each sum to 1) minimising
+    <P, cost_matrix> - eps * H(P), via log-space Sinkhorn-Knopp. As eps -> 0, P converges to the
+    hard optimal permutation found by linear_sum_assignment on the same cost matrix (assuming a
+    unique optimum); as eps -> inf, P converges to the uniform matrix 1/n.
+
+    Args:
+        cost_matrix (torch.Tensor): Square cost matrix, shape [n, n].
+        eps (float): Entropic regularisation / temperature. Must be > 0.
+        n_iters (int): Number of alternating row/col normalisation steps.
+
+    Returns:
+        torch.Tensor: Doubly-stochastic soft assignment matrix, shape [n, n].
+    """
+
+    if cost_matrix.size(0) != cost_matrix.size(1):
+        raise ValueError(f"cost_matrix must be square, got shape {tuple(cost_matrix.shape)}.")
+
+    if eps <= 0:
+        raise ValueError(f"eps must be > 0, got {eps}.")
+
+    n = cost_matrix.size(0)
+    f = torch.zeros(n, dtype=cost_matrix.dtype, device=cost_matrix.device)
+    g = torch.zeros(n, dtype=cost_matrix.dtype, device=cost_matrix.device)
+
+    # Log-space updates keep this stable even for very small eps, where exp(-cost / eps) alone
+    # would under/overflow. Marginals are both all-ones (target row/col sums of 1, ie a
+    # permutation-like matrix), not the usual OT convention of probability-simplex marginals.
+    for _ in range(n_iters):
+        f = -eps * torch.logsumexp((g.unsqueeze(0) - cost_matrix) / eps, dim=1)
+        g = -eps * torch.logsumexp((f.unsqueeze(1) - cost_matrix) / eps, dim=0)
+
+    log_plan = (f.unsqueeze(1) + g.unsqueeze(0) - cost_matrix) / eps
+    return torch.exp(log_plan)
+
+
 def calc_com(coords, node_mask=None):
     """Calculates the centre of mass of a pointcloud
 

@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 import torch
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial.transform import Rotation
 
 import semlaflow.util.functional as smolF
@@ -385,6 +386,68 @@ class GeometryFnsTests(unittest.TestCase):
         np.testing.assert_almost_equal(exp_coords_1, rotated_1, decimal=5)
         np.testing.assert_almost_equal(exp_coords_2, rotated_2, decimal=5)
         np.testing.assert_almost_equal(exp_coords_3, rotated_3, decimal=5)
+
+
+class SinkhornFnsTests(unittest.TestCase):
+    def test_sinkhorn_rows_and_cols_sum_to_one(self):
+        torch.manual_seed(0)
+        coords1 = torch.rand((6, 3))
+        coords2 = torch.rand((6, 3))
+        cost_matrix = smolF.inter_distances(coords1, coords2, sqrd=True)
+
+        plan = smolF.sinkhorn(cost_matrix, eps=0.1, n_iters=200)
+
+        row_sums = plan.sum(dim=1)
+        col_sums = plan.sum(dim=0)
+
+        np.testing.assert_almost_equal(torch.ones(6).tolist(), row_sums.tolist(), decimal=4)
+        np.testing.assert_almost_equal(torch.ones(6).tolist(), col_sums.tolist(), decimal=4)
+
+    def test_sinkhorn_converges_to_hard_assignment_as_eps_shrinks(self):
+        torch.manual_seed(1)
+        coords1 = torch.rand((5, 3))
+        coords2 = torch.rand((5, 3))
+        cost_matrix = smolF.inter_distances(coords1, coords2, sqrd=True)
+
+        row_indices, col_indices = linear_sum_assignment(cost_matrix.numpy())
+        exp_hard_plan = np.zeros((5, 5))
+        exp_hard_plan[row_indices, col_indices] = 1.0
+
+        plan = smolF.sinkhorn(cost_matrix, eps=1e-4, n_iters=1000)
+
+        np.testing.assert_almost_equal(exp_hard_plan, plan.numpy(), decimal=2)
+
+    def test_sinkhorn_uniform_as_eps_grows(self):
+        torch.manual_seed(2)
+        coords1 = torch.rand((4, 3))
+        coords2 = torch.rand((4, 3))
+        cost_matrix = smolF.inter_distances(coords1, coords2, sqrd=True)
+
+        plan = smolF.sinkhorn(cost_matrix, eps=1e5, n_iters=200)
+
+        exp_uniform = torch.full((4, 4), 0.25)
+        np.testing.assert_almost_equal(exp_uniform.tolist(), plan.tolist(), decimal=3)
+
+    def test_sinkhorn_stable_for_very_small_eps(self):
+        torch.manual_seed(3)
+        coords1 = torch.rand((8, 3))
+        coords2 = torch.rand((8, 3))
+        cost_matrix = smolF.inter_distances(coords1, coords2, sqrd=True)
+
+        plan = smolF.sinkhorn(cost_matrix, eps=1e-6, n_iters=200)
+
+        self.assertFalse(torch.isnan(plan).any().item())
+        self.assertFalse(torch.isinf(plan).any().item())
+
+    def test_sinkhorn_rejects_non_square_cost_matrix(self):
+        cost_matrix = torch.rand((3, 4))
+        with self.assertRaises(ValueError):
+            smolF.sinkhorn(cost_matrix, eps=0.1)
+
+    def test_sinkhorn_rejects_non_positive_eps(self):
+        cost_matrix = torch.rand((3, 3))
+        with self.assertRaises(ValueError):
+            smolF.sinkhorn(cost_matrix, eps=0.0)
 
 
 if __name__ == "__main__":

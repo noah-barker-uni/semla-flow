@@ -10,6 +10,8 @@ import semlaflow.util.functional as smolF
 from semlaflow.util.molrepr import GeometricMol, GeometricMolBatch, SmolBatch, SmolMol
 
 SCALE_OT_FACTOR = 0.2
+SINKHORN_MIN_EPS = 1e-3
+COUPLING_TYPES = ["none", "hungarian", "sinkhorn"]
 
 
 _InterpT = tuple[list[SmolMol], list[SmolMol], list[SmolMol], torch.Tensor]
@@ -152,7 +154,9 @@ class GeometricInterpolant(Interpolant):
         bond_interpolation: str = "unmask",
         coord_noise_std: float = 0.0,
         type_dist_temp: float = 1.0,
-        equivariant_ot: bool = False,
+        coupling: str = "none",
+        kabsch_align: bool = False,
+        sinkhorn_n_iters: int = 100,
         batch_ot: bool = False,
         time_alpha: float = 1.0,
         time_beta: float = 1.0,
@@ -171,13 +175,18 @@ class GeometricInterpolant(Interpolant):
         if bond_interpolation not in ["dirichlet", "unmask"]:
             raise ValueError(f"bond interpolation '{bond_interpolation}' not supported.")
 
+        if coupling not in COUPLING_TYPES:
+            raise ValueError(f"coupling '{coupling}' not supported. Accepted values: {COUPLING_TYPES}.")
+
         self.prior_sampler = prior_sampler
         self.coord_interpolation = coord_interpolation
         self.type_interpolation = type_interpolation
         self.bond_interpolation = bond_interpolation
         self.coord_noise_std = coord_noise_std
         self.type_dist_temp = type_dist_temp
-        self.equivariant_ot = equivariant_ot
+        self.coupling = coupling
+        self.kabsch_align = kabsch_align
+        self.sinkhorn_n_iters = sinkhorn_n_iters
         self.batch_ot = batch_ot
         self.time_alpha = time_alpha if fixed_time is None else None
         self.time_beta = time_beta if fixed_time is None else None
@@ -194,12 +203,16 @@ class GeometricInterpolant(Interpolant):
             "bond-interpolation": self.bond_interpolation,
             "coord-noise-std": self.coord_noise_std,
             "type-dist-temp": self.type_dist_temp,
-            "equivariant-ot": self.equivariant_ot,
+            "coupling": self.coupling,
+            "kabsch-align": self.kabsch_align,
             "batch-ot": self.batch_ot,
             "time-alpha": self.time_alpha,
             "time-beta": self.time_beta,
             **prior_hparams,
         }
+
+        if self.coupling == "sinkhorn":
+            hparams["sinkhorn-n-iters"] = self.sinkhorn_n_iters
 
         if self.fixed_time is not None:
             hparams["fixed-interpolation-time"] = self.fixed_time
@@ -212,35 +225,43 @@ class GeometricInterpolant(Interpolant):
 
         from_mols = [self.prior_sampler.sample_molecule(num_atoms) for _ in to_mols]
 
-        # Choose best possible matches for the whole batch if using batch OT
-        if self.batch_ot:
-            from_mols = [mol.zero_com() for mol in from_mols]
-            to_mols = [mol.zero_com() for mol in to_mols]
-            from_mols = self._ot_map(from_mols, to_mols)
-
-        # Within match_mols either just truncate noise to match size of data molecule
-        # Or also permute and rotate the noise to best match data molecule
-        else:
-            from_mols = [self._match_mols(from_mol, to_mol) for from_mol, to_mol in zip(from_mols, to_mols)]
-
+        # Sample times before matching -- sinkhorn coupling needs t to set its temperature
         if self.fixed_time is not None:
             times = torch.tensor([self.fixed_time] * batch_size)
         else:
             times = self.time_dist.sample((batch_size,))
 
-        tuples = zip(from_mols, to_mols, times.tolist())
+        times_list = times.tolist()
+
+        # Choose best possible matches for the whole batch if using batch OT
+        if self.batch_ot:
+            from_mols = [mol.zero_com() for mol in from_mols]
+            to_mols = [mol.zero_com() for mol in to_mols]
+            from_mols = self._ot_map(from_mols, to_mols, times_list)
+
+        # Within match_mols either just truncate noise to match size of data molecule
+        # Or also couple (hard/soft) and optionally rotate the noise to best match data molecule
+        else:
+            from_mols = [
+                self._match_mols(from_mol, to_mol, t)
+                for from_mol, to_mol, t in zip(from_mols, to_mols, times_list)
+            ]
+
+        tuples = zip(from_mols, to_mols, times_list)
         interp_mols = [self._interpolate_mol(from_mol, to_mol, t) for from_mol, to_mol, t in tuples]
         return from_mols, to_mols, interp_mols, list(times)
 
-    def _ot_map(self, from_mols: list[GeometricMol], to_mols: list[GeometricMol]) -> list[GeometricMol]:
+    def _ot_map(
+        self, from_mols: list[GeometricMol], to_mols: list[GeometricMol], times: list[float]
+    ) -> list[GeometricMol]:
         """Permute the from_mols batch so that it forms an approximate mini-batch OT map with to_mols"""
 
         mol_matrix = []
         cost_matrix = []
 
         # Create matrix with to mols on outer axis and from mols on inner axis
-        for to_mol in to_mols:
-            best_from_mols = [self._match_mols(from_mol, to_mol) for from_mol in from_mols]
+        for to_mol, t in zip(to_mols, times):
+            best_from_mols = [self._match_mols(from_mol, to_mol, t) for from_mol in from_mols]
             best_costs = [self._match_cost(mol, to_mol) for mol in best_from_mols]
             mol_matrix.append(list(best_from_mols))
             cost_matrix.append(list(best_costs))
@@ -249,24 +270,38 @@ class GeometricInterpolant(Interpolant):
         best_from_mols = [mol_matrix[r][c] for r, c in zip(row_indices, col_indices)]
         return best_from_mols
 
-    def _match_mols(self, from_mol: GeometricMol, to_mol: GeometricMol) -> GeometricMol:
-        """Permute the from_mol to best match the to_mol and return the permuted from_mol"""
+    def _match_mols(self, from_mol: GeometricMol, to_mol: GeometricMol, t: Optional[float] = None) -> GeometricMol:
+        """Couple the from_mol to the to_mol (hard or soft), optionally Kabsch-align, and return the result"""
 
         if to_mol.seq_length > from_mol.seq_length:
             raise RuntimeError("from_mol must have at least as many atoms as to_mol.")
 
-        # Find best permutation first, then best rotation
+        # Find best coupling first, then best rotation
         # As done in Equivariant Flow Matching (https://arxiv.org/abs/2306.15030)
 
         # Keep the same number of atoms as the data mol in the noise mol
         from_mol = from_mol.permute(list(range(to_mol.seq_length)))
 
-        if not self.equivariant_ot:
+        if self.coupling == "none":
             return from_mol
 
         cost_matrix = smolF.inter_distances(to_mol.coords.cpu(), from_mol.coords.cpu(), sqrd=True)
-        _, from_mol_indices = linear_sum_assignment(cost_matrix.numpy())
-        from_mol = from_mol.permute(from_mol_indices.tolist())
+
+        if self.coupling == "hungarian":
+            _, from_mol_indices = linear_sum_assignment(cost_matrix.numpy())
+            from_mol = from_mol.permute(from_mol_indices.tolist())
+
+        elif self.coupling == "sinkhorn":
+            if t is None:
+                raise ValueError("t must be provided to use sinkhorn coupling.")
+
+            # Diffuse early in the trajectory, sharpen onto the Hungarian answer as t -> 1
+            eps = max((1.0 - t) ** 2, SINKHORN_MIN_EPS)
+            plan = smolF.sinkhorn(cost_matrix, eps, n_iters=self.sinkhorn_n_iters)
+            from_mol = from_mol.soft_permute(plan)
+
+        if not self.kabsch_align:
+            return from_mol
 
         padded_coords = smolF.pad_tensors([from_mol.coords.cpu(), to_mol.coords.cpu()])
         from_mol_coords = padded_coords[0].numpy()
