@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Optional, Union
 
 import torch
 from scipy.spatial.transform import Rotation
@@ -493,6 +493,109 @@ def sinkhorn(cost_matrix: torch.Tensor, eps: float, n_iters: int = 100) -> torch
 
     log_plan = (f.unsqueeze(1) + g.unsqueeze(0) - cost_matrix) / eps
     return torch.exp(log_plan)
+
+
+def mcmc_permutation(
+    cost: torch.Tensor,
+    node_mask: torch.Tensor,
+    eps: torch.Tensor,
+    n_iters: int,
+    init_perm: torch.Tensor,
+    proposal: str = "knn",
+    knn_k: int = 8,
+    to_coords: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Batched Metropolis sampling over permutations via transposition proposals.
+
+    Targets p(perm) ~ exp(-cost(perm) / eps) on the same cost matrix used for hungarian/sinkhorn
+    coupling, batched across molecules of differing real size via node_mask padding. Intended to
+    be initialised at the hungarian solution (init_perm) and refined for n_iters swap proposals.
+
+    Args:
+        cost (torch.Tensor): Padded cost matrix, shape [B, N, N]. cost[b, i, j] is the cost of
+            assigning position i to candidate j for batch element b.
+        node_mask (torch.Tensor): Shape [B, N], 1 for real (non-padding) positions.
+        eps (torch.Tensor): Per-batch-element temperature, shape [B]. Must be > 0.
+        n_iters (int): Number of Metropolis iterations.
+        init_perm (torch.Tensor): Starting permutation, shape [B, N] long. Values at padding
+            positions are never read.
+        proposal (str): "uniform" (any valid pair) or "knn" (restrict swaps to spatially-nearby
+            position pairs, via to_coords). Uniform proposals have near-zero acceptance for large
+            N since most random pairs are far apart.
+        knn_k (int): Number of nearest neighbours to restrict proposals to, if proposal == "knn".
+        to_coords (torch.Tensor): Padded position coordinates, shape [B, N, 3]. Required (and
+            only used) if proposal == "knn" -- this is the fixed geometry the swap positions live
+            in (to_mol coords), not the candidates being assigned.
+
+    Returns:
+        torch.Tensor: Final permutation, shape [B, N] long.
+    """
+
+    if proposal not in ("uniform", "knn"):
+        raise ValueError(f"proposal '{proposal}' not supported. Accepted values: 'uniform', 'knn'.")
+
+    if proposal == "knn" and to_coords is None:
+        raise ValueError("to_coords must be provided when proposal == 'knn'.")
+
+    batch_size, n = node_mask.shape
+    if cost.shape != (batch_size, n, n):
+        raise ValueError(f"cost must have shape ({batch_size}, {n}, {n}), got {tuple(cost.shape)}.")
+
+    if init_perm.shape != (batch_size, n):
+        raise ValueError(f"init_perm must have shape ({batch_size}, {n}), got {tuple(init_perm.shape)}.")
+
+    node_mask = node_mask.long()
+    seq_lengths = node_mask.sum(dim=1)
+    can_swap_mask = seq_lengths >= 2
+
+    perm = init_perm.clone().long()
+
+    # No valid swap is possible anywhere in the batch (also avoids a degenerate k=0 topk below)
+    if n < 2:
+        return perm
+
+    knn_adj = None
+    if proposal == "knn":
+        k_eff = min(knn_k, n - 1)
+        knn_adj = edges_from_nodes(to_coords, k=k_eff, node_mask=node_mask, edge_format="adjacency")
+
+    batch_idx = torch.arange(batch_size, device=cost.device)
+
+    for _ in range(n_iters):
+        i = torch.multinomial(node_mask.float(), 1)
+
+        if proposal == "uniform":
+            row = node_mask.clone()
+            row.scatter_(1, i, 0)
+        else:
+            row = torch.gather(knn_adj, 1, i.unsqueeze(-1).expand(-1, -1, n)).squeeze(1)
+
+        # Degenerate rows (eg. n_b == 1, so there is no second valid position / no knn neighbour)
+        # would leave torch.multinomial with an all-zero row to sample from -- fall back to
+        # node_mask so sampling never errors. can_swap_mask below ensures these proposals, whatever
+        # they end up being, are never actually accepted.
+        row_safe = torch.where(row.sum(dim=1, keepdim=True) > 0, row, node_mask)
+        i_prime = torch.multinomial(row_safe.float(), 1)
+
+        i_, ip_ = i.squeeze(1), i_prime.squeeze(1)
+        perm_i, perm_ip = perm[batch_idx, i_], perm[batch_idx, ip_]
+
+        old_cost = cost[batch_idx, i_, perm_i] + cost[batch_idx, ip_, perm_ip]
+        new_cost = cost[batch_idx, i_, perm_ip] + cost[batch_idx, ip_, perm_i]
+        delta = new_cost - old_cost
+
+        # Proposal only depends on static geometry (never on the current perm), so swapping
+        # (i, i') is a self-inverse move with q(perm->perm') == q(perm'->perm) by construction --
+        # plain Metropolis (no Hastings correction) is exact here.
+        accept_prob = torch.clamp(torch.exp(-delta / eps), max=1.0)
+        accept = (torch.rand(batch_size, device=cost.device) < accept_prob) & can_swap_mask
+
+        new_i = torch.where(accept, perm_ip, perm_i)
+        new_ip = torch.where(accept, perm_i, perm_ip)
+        perm[batch_idx, i_] = new_i
+        perm[batch_idx, ip_] = new_ip
+
+    return perm
 
 
 def calc_com(coords, node_mask=None):

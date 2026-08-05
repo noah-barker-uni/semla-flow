@@ -10,8 +10,9 @@ import semlaflow.util.functional as smolF
 from semlaflow.util.molrepr import GeometricMol, GeometricMolBatch, SmolBatch, SmolMol
 
 SCALE_OT_FACTOR = 0.2
-SINKHORN_MIN_EPS = 1e-3
-COUPLING_TYPES = ["none", "hungarian", "sinkhorn"]
+COUPLING_MIN_EPS = 1e-3
+COUPLING_TYPES = ["none", "hungarian", "sinkhorn", "mcmc"]
+MCMC_PROPOSAL_TYPES = ["uniform", "knn"]
 
 
 _InterpT = tuple[list[SmolMol], list[SmolMol], list[SmolMol], torch.Tensor]
@@ -157,6 +158,9 @@ class GeometricInterpolant(Interpolant):
         coupling: str = "none",
         kabsch_align: bool = False,
         sinkhorn_n_iters: int = 100,
+        mcmc_n_iters: int = 100,
+        mcmc_proposal: str = "knn",
+        mcmc_knn_k: int = 8,
         batch_ot: bool = False,
         time_alpha: float = 1.0,
         time_beta: float = 1.0,
@@ -178,6 +182,18 @@ class GeometricInterpolant(Interpolant):
         if coupling not in COUPLING_TYPES:
             raise ValueError(f"coupling '{coupling}' not supported. Accepted values: {COUPLING_TYPES}.")
 
+        if mcmc_proposal not in MCMC_PROPOSAL_TYPES:
+            raise ValueError(
+                f"mcmc_proposal '{mcmc_proposal}' not supported. Accepted values: {MCMC_PROPOSAL_TYPES}."
+            )
+
+        if coupling == "mcmc" and batch_ot:
+            raise ValueError(
+                "coupling='mcmc' cannot be combined with batch_ot=True: mcmc coupling only runs as "
+                "a single batched pass over the current (from_mol, to_mol) pairing, whereas batch_ot "
+                "needs a per-pair coupling callable evaluated over all B^2 candidate pairs."
+            )
+
         self.prior_sampler = prior_sampler
         self.coord_interpolation = coord_interpolation
         self.type_interpolation = type_interpolation
@@ -187,6 +203,9 @@ class GeometricInterpolant(Interpolant):
         self.coupling = coupling
         self.kabsch_align = kabsch_align
         self.sinkhorn_n_iters = sinkhorn_n_iters
+        self.mcmc_n_iters = mcmc_n_iters
+        self.mcmc_proposal = mcmc_proposal
+        self.mcmc_knn_k = mcmc_knn_k
         self.batch_ot = batch_ot
         self.time_alpha = time_alpha if fixed_time is None else None
         self.time_beta = time_beta if fixed_time is None else None
@@ -214,6 +233,11 @@ class GeometricInterpolant(Interpolant):
         if self.coupling == "sinkhorn":
             hparams["sinkhorn-n-iters"] = self.sinkhorn_n_iters
 
+        if self.coupling == "mcmc":
+            hparams["mcmc-n-iters"] = self.mcmc_n_iters
+            hparams["mcmc-proposal"] = self.mcmc_proposal
+            hparams["mcmc-knn-k"] = self.mcmc_knn_k
+
         if self.fixed_time is not None:
             hparams["fixed-interpolation-time"] = self.fixed_time
 
@@ -233,8 +257,13 @@ class GeometricInterpolant(Interpolant):
 
         times_list = times.tolist()
 
+        # mcmc coupling needs its own batched pass over the whole minibatch (see _mcmc_couple);
+        # it cannot be combined with batch_ot (enforced in __init__)
+        if self.coupling == "mcmc":
+            from_mols = self._mcmc_couple(from_mols, to_mols, times_list)
+
         # Choose best possible matches for the whole batch if using batch OT
-        if self.batch_ot:
+        elif self.batch_ot:
             from_mols = [mol.zero_com() for mol in from_mols]
             to_mols = [mol.zero_com() for mol in to_mols]
             from_mols = self._ot_map(from_mols, to_mols, times_list)
@@ -296,21 +325,78 @@ class GeometricInterpolant(Interpolant):
                 raise ValueError("t must be provided to use sinkhorn coupling.")
 
             # Diffuse early in the trajectory, sharpen onto the Hungarian answer as t -> 1
-            eps = max((1.0 - t) ** 2, SINKHORN_MIN_EPS)
+            eps = max((1.0 - t) ** 2, COUPLING_MIN_EPS)
             plan = smolF.sinkhorn(cost_matrix, eps, n_iters=self.sinkhorn_n_iters)
             from_mol = from_mol.soft_permute(plan)
 
         if not self.kabsch_align:
             return from_mol
 
+        return self._kabsch_align(from_mol, to_mol)
+
+    def _kabsch_align(self, from_mol: GeometricMol, to_mol: GeometricMol) -> GeometricMol:
+        """Rigidly rotate from_mol onto to_mol (Kabsch/Wahba via SVD), assuming matching atom order"""
+
         padded_coords = smolF.pad_tensors([from_mol.coords.cpu(), to_mol.coords.cpu()])
         from_mol_coords = padded_coords[0].numpy()
         to_mol_coords = padded_coords[1].numpy()
 
         rotation, _ = Rotation.align_vectors(to_mol_coords, from_mol_coords)
-        from_mol = from_mol.rotate(rotation)
+        return from_mol.rotate(rotation)
 
-        return from_mol
+    def _mcmc_couple(
+        self, from_mols: list[GeometricMol], to_mols: list[GeometricMol], times: list[float]
+    ) -> list[GeometricMol]:
+        """Couple each from_mol to its to_mol via batched Metropolis sampling over permutations.
+
+        Initialises each molecule's chain at its own Hungarian solution (unavoidably a per-molecule
+        scipy call, same one-time cost already paid by coupling="hungarian"), then refines all
+        molecules together for mcmc_n_iters swap-proposal iterations as batched tensor ops -- see
+        smolF.mcmc_permutation. Uses the same cost matrix and eps=(1-t)^2 temperature schedule as
+        coupling="sinkhorn" so the two are directly comparable.
+        """
+
+        # Keep the same number of atoms as the data mol in the noise mol, same as _match_mols
+        trunc_from_mols = [
+            from_mol.permute(list(range(to_mol.seq_length))) for from_mol, to_mol in zip(from_mols, to_mols)
+        ]
+
+        seq_lengths = torch.tensor([to_mol.seq_length for to_mol in to_mols])
+        to_coords = smolF.pad_tensors([to_mol.coords.cpu() for to_mol in to_mols])
+        from_coords = smolF.pad_tensors([from_mol.coords.cpu() for from_mol in trunc_from_mols])
+        n_pad = seq_lengths.max().item()
+        node_mask = (torch.arange(n_pad).unsqueeze(0) < seq_lengths.unsqueeze(1)).long()
+
+        cost = smolF.inter_distances(to_coords, from_coords, sqrd=True)
+
+        # Hungarian init, one scipy call per molecule on its own real-sized cost submatrix
+        init_perm = torch.arange(n_pad).unsqueeze(0).repeat(len(to_mols), 1).clone()
+        for b, n_b in enumerate(seq_lengths.tolist()):
+            _, col_ind = linear_sum_assignment(cost[b, :n_b, :n_b].numpy())
+            init_perm[b, :n_b] = torch.as_tensor(col_ind)
+
+        eps = torch.clamp((1.0 - torch.tensor(times)) ** 2, min=COUPLING_MIN_EPS)
+
+        final_perm = smolF.mcmc_permutation(
+            cost,
+            node_mask,
+            eps,
+            self.mcmc_n_iters,
+            init_perm=init_perm,
+            proposal=self.mcmc_proposal,
+            knn_k=self.mcmc_knn_k,
+            to_coords=to_coords,
+        )
+
+        result = [
+            trunc_from_mols[b].permute(final_perm[b, :n_b].tolist())
+            for b, n_b in enumerate(seq_lengths.tolist())
+        ]
+
+        if self.kabsch_align:
+            result = [self._kabsch_align(from_mol, to_mol) for from_mol, to_mol in zip(result, to_mols)]
+
+        return result
 
     def _match_cost(self, from_mol: GeometricMol, to_mol: GeometricMol) -> float:
         """Calculate MSE between mol coords as a match cost"""

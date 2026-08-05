@@ -450,5 +450,132 @@ class SinkhornFnsTests(unittest.TestCase):
             smolF.sinkhorn(cost_matrix, eps=0.0)
 
 
+def _hungarian_init(cost, seq_lengths):
+    batch_size, n, _ = cost.shape
+    perm = torch.arange(n).unsqueeze(0).repeat(batch_size, 1).clone()
+    for b in range(batch_size):
+        n_b = seq_lengths[b].item()
+        _, col_ind = linear_sum_assignment(cost[b, :n_b, :n_b].numpy())
+        perm[b, :n_b] = torch.as_tensor(col_ind)
+    return perm
+
+
+def _perm_cost(cost, perm, seq_lengths):
+    total = 0.0
+    for b in range(cost.size(0)):
+        n_b = seq_lengths[b].item()
+        for i in range(n_b):
+            total += cost[b, i, perm[b, i]].item()
+    return total
+
+
+class MCMCPermutationFnsTests(unittest.TestCase):
+    def _random_batch(self, seq_lengths, seed):
+        torch.manual_seed(seed)
+        batch_size = len(seq_lengths)
+        n = max(seq_lengths)
+        seq_lengths_t = torch.tensor(seq_lengths)
+        to_coords = torch.rand((batch_size, n, 3))
+        from_coords = torch.rand((batch_size, n, 3))
+        node_mask = (torch.arange(n).unsqueeze(0) < seq_lengths_t.unsqueeze(1)).long()
+        cost = smolF.inter_distances(to_coords, from_coords, sqrd=True)
+        return cost, node_mask, to_coords, seq_lengths_t
+
+    def test_padded_positions_stay_at_init_value(self):
+        cost, node_mask, to_coords, seq_lengths = self._random_batch([5, 3, 5], seed=0)
+        init_perm = _hungarian_init(cost, seq_lengths)
+
+        out = smolF.mcmc_permutation(
+            cost, node_mask, eps=torch.full((3,), 0.5), n_iters=100,
+            init_perm=init_perm.clone(), proposal="uniform",
+        )
+
+        self.assertTrue(torch.equal(out[1, 3:], init_perm[1, 3:]))
+
+    def test_tiny_eps_stays_at_already_optimal_init(self):
+        cost, node_mask, to_coords, seq_lengths = self._random_batch([6, 6], seed=1)
+        init_perm = _hungarian_init(cost, seq_lengths)
+
+        out = smolF.mcmc_permutation(
+            cost, node_mask, eps=torch.full((2,), 1e-4), n_iters=200,
+            init_perm=init_perm.clone(), proposal="knn", knn_k=4, to_coords=to_coords,
+        )
+
+        self.assertTrue(torch.equal(out, init_perm))
+
+    def test_cost_does_not_increase_on_average_from_hungarian_init(self):
+        for proposal in ["uniform", "knn"]:
+            costs_after = []
+            for seed in range(5):
+                cost, node_mask, to_coords, seq_lengths = self._random_batch([8, 8], seed=seed)
+                init_perm = _hungarian_init(cost, seq_lengths)
+                init_cost = _perm_cost(cost, init_perm, seq_lengths)
+
+                out = smolF.mcmc_permutation(
+                    cost, node_mask, eps=torch.full((2,), 0.02), n_iters=100,
+                    init_perm=init_perm.clone(), proposal=proposal, knn_k=4, to_coords=to_coords,
+                )
+                costs_after.append(_perm_cost(cost, out, seq_lengths) - init_cost)
+
+            self.assertLessEqual(np.mean(costs_after), 0.5)
+
+    def test_n_less_than_two_short_circuits(self):
+        node_mask = torch.ones((2, 1), dtype=torch.long)
+        cost = torch.zeros((2, 1, 1))
+        init_perm = torch.zeros((2, 1), dtype=torch.long)
+
+        out = smolF.mcmc_permutation(
+            cost, node_mask, eps=torch.ones(2), n_iters=10, init_perm=init_perm, proposal="uniform"
+        )
+
+        self.assertTrue(torch.equal(out, init_perm))
+
+    def test_mixed_batch_with_single_atom_molecule_does_not_crash_or_move(self):
+        cost, node_mask, to_coords, seq_lengths = self._random_batch([1, 6], seed=2)
+        init_perm = _hungarian_init(cost, seq_lengths)
+
+        for proposal in ["uniform", "knn"]:
+            out = smolF.mcmc_permutation(
+                cost, node_mask, eps=torch.full((2,), 0.5), n_iters=50,
+                init_perm=init_perm.clone(), proposal=proposal, knn_k=8, to_coords=to_coords,
+            )
+            self.assertTrue(torch.equal(out[0, :1], init_perm[0, :1]))
+
+    def test_knn_k_larger_than_n_minus_one_does_not_crash(self):
+        cost, node_mask, to_coords, seq_lengths = self._random_batch([4, 4], seed=3)
+        init_perm = _hungarian_init(cost, seq_lengths)
+
+        out = smolF.mcmc_permutation(
+            cost, node_mask, eps=torch.full((2,), 0.5), n_iters=20,
+            init_perm=init_perm.clone(), proposal="knn", knn_k=100, to_coords=to_coords,
+        )
+        self.assertEqual(out.shape, init_perm.shape)
+
+    def test_result_stays_a_valid_permutation_per_molecule(self):
+        cost, node_mask, to_coords, seq_lengths = self._random_batch([5, 3, 7], seed=4)
+        init_perm = _hungarian_init(cost, seq_lengths)
+
+        out = smolF.mcmc_permutation(
+            cost, node_mask, eps=torch.full((3,), 0.3), n_iters=100,
+            init_perm=init_perm.clone(), proposal="knn", knn_k=3, to_coords=to_coords,
+        )
+
+        for b in range(3):
+            n_b = seq_lengths[b].item()
+            self.assertEqual(sorted(out[b, :n_b].tolist()), list(range(n_b)))
+
+    def test_rejects_unknown_proposal(self):
+        cost, node_mask, to_coords, seq_lengths = self._random_batch([4, 4], seed=5)
+        init_perm = _hungarian_init(cost, seq_lengths)
+        with self.assertRaises(ValueError):
+            smolF.mcmc_permutation(cost, node_mask, eps=torch.ones(2), n_iters=5, init_perm=init_perm, proposal="bogus")
+
+    def test_knn_proposal_requires_to_coords(self):
+        cost, node_mask, to_coords, seq_lengths = self._random_batch([4, 4], seed=6)
+        init_perm = _hungarian_init(cost, seq_lengths)
+        with self.assertRaises(ValueError):
+            smolF.mcmc_permutation(cost, node_mask, eps=torch.ones(2), n_iters=5, init_perm=init_perm, proposal="knn")
+
+
 if __name__ == "__main__":
     unittest.main()
