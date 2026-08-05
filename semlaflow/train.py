@@ -346,6 +346,9 @@ def main(args):
     # torch._dynamo.config.cache_size_limit = util.COMPILER_CACHE_SIZE
     # print(f"Set torch compiler cache size to {torch._dynamo.config.cache_size_limit}")
 
+    if args.resume_ckpt_path is not None and not Path(args.resume_ckpt_path).exists():
+        raise FileNotFoundError(f"resume_ckpt_path '{args.resume_ckpt_path}' does not exist.")
+
     L.seed_everything(12345)
     util.disable_lib_stdout()
     util.configure_fs()
@@ -364,8 +367,11 @@ def main(args):
 
     trainer = build_trainer(args)
 
+    if args.resume_ckpt_path is not None:
+        print(f"Resuming training from checkpoint {args.resume_ckpt_path}...")
+
     print("Fitting datamodule to model...")
-    trainer.fit(model, datamodule=dm)
+    trainer.fit(model, datamodule=dm, ckpt_path=args.resume_ckpt_path)
     print("Training complete.")
 
 
@@ -376,6 +382,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str)
     parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET)
     parser.add_argument("--trial_run", action="store_true")
+    parser.add_argument("--resume_ckpt_path", type=str, default=None)
 
     # Model args
     parser.add_argument("--d_model", type=int, default=DEFAULT_D_MODEL)
