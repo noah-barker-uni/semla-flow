@@ -5,6 +5,7 @@ datasets/
 wandb/
 output/
 venv/
+checkpoints/
 
 # Editors
 .vscode/

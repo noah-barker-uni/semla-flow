@@ -321,11 +321,18 @@ def build_trainer(args):
     val_check_epochs = 1 if args.trial_run else args.val_check_epochs
 
     project_name = f"{util.PROJECT_PREFIX}-{args.dataset}"
+    run_name = args.run_name if args.run_name is not None else args.coupling
     print("Using precision '32'")
 
-    logger = WandbLogger(project=project_name, save_dir="wandb", log_model=True)
+    logger = WandbLogger(project=project_name, name=run_name, save_dir="wandb", log_model=True)
     lr_monitor = LearningRateMonitor(logging_interval="step")
-    checkpointing = ModelCheckpoint(every_n_epochs=val_check_epochs, monitor="val-validity", mode="max", save_last=True)
+    checkpointing = ModelCheckpoint(
+        dirpath=f"checkpoints/{run_name}",
+        every_n_epochs=val_check_epochs,
+        monitor="val-validity",
+        mode="max",
+        save_last=True,
+    )
 
     # No logger if doing a trial run
     logger = None if args.trial_run else logger
@@ -389,6 +396,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET)
     parser.add_argument("--trial_run", action="store_true")
     parser.add_argument("--resume_ckpt_path", type=str, default=None)
+    parser.add_argument("--run_name", type=str, default=None)
 
     # Model args
     parser.add_argument("--d_model", type=int, default=DEFAULT_D_MODEL)
