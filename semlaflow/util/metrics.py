@@ -9,8 +9,12 @@ import semlaflow.util.rdkit as smolRD
 
 ALLOWED_VALENCIES = {
     "H": {0: 1, 1: 0, -1: 0},
-    "C": {0: [3, 4], 1: 3, -1: 3},
-    "N": {0: [2, 3], 1: [2, 3, 4], -1: 2},  # In QM9, N+ seems to be present in the form NH+ and NH2+
+    # Neutral C/N previously also allowed valence 3/2 respectively -- an aromatic-bond-rounding
+    # bug documented in Nikitin et al. "GEOM-Drugs Revisited" (arXiv 2505.00169), which named
+    # this codebase as one of several affected. RDKit's GetExplicitValence() already resolves
+    # aromaticity correctly, so neutral C/N should only ever be valence 4/3.
+    "C": {0: 4, 1: 3, -1: 3},
+    "N": {0: 3, 1: [2, 3, 4], -1: 2},  # In QM9, N+ seems to be present in the form NH+ and NH2+
     "O": {0: 2, 1: 3, -1: 1},
     "F": {0: 1, -1: 0},
     "B": 3,

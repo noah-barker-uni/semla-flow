@@ -861,8 +861,10 @@ class MolecularCFM(L.LightningModule):
         charge_loss = (charge_loss * mask).sum(dim=1) / n_atoms
         return charge_loss
 
-    def _generate(self, prior, steps, strategy="linear"):
+    def _generate(self, prior, steps, strategy="linear", record_trajectory=False):
         if self.distill:
+            if record_trajectory:
+                raise NotImplementedError("record_trajectory is not supported for distilled (self.distill) models.")
             return self._distill_generate(prior)
 
         if strategy == "linear":
@@ -884,6 +886,11 @@ class MolecularCFM(L.LightningModule):
             "atomics": torch.zeros_like(prior["atomics"]),
             "bonds": torch.zeros_like(prior["bonds"])
         }
+
+        # Coordinates at each step, physical units applied at the end alongside predicted["coords"]
+        # (straightness itself is scale-invariant, but keeping units consistent with the final output
+        # makes an eventual absolute path-length number meaningful too)
+        trajectory = [curr["coords"].clone()] if record_trajectory else None
 
         with torch.no_grad():
             for step_size in step_sizes:
@@ -910,7 +917,13 @@ class MolecularCFM(L.LightningModule):
                 curr = self.integrator.step(curr, predicted, prior, times, step_size)
                 times = times + step_size
 
+                if record_trajectory:
+                    trajectory.append(curr["coords"].clone())
+
         predicted["coords"] = predicted["coords"] * self.coord_scale
+        if record_trajectory:
+            predicted["trajectory"] = torch.stack(trajectory, dim=1) * self.coord_scale
+
         return predicted
 
     def _distill_generate(self, prior):

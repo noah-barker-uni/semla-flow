@@ -22,6 +22,7 @@ DEFAULT_BUCKET_COST_SCALE = "linear"
 DEFAULT_INTEGRATION_STEPS = 100
 DEFAULT_CAT_SAMPLING_NOISE_LEVEL = 1
 DEFAULT_ODE_SAMPLING_STRATEGY = "log"
+DEFAULT_SEED = 12345
 
 
 def load_model(args, vocab):
@@ -216,7 +217,7 @@ def main(args):
     if args.n_replicates < 1:
         raise ValueError("n_replicates must be at least 1.")
 
-    L.seed_everything(12345)
+    L.seed_everything(args.seed)
     util.disable_lib_stdout()
     util.configure_fs()
 
@@ -257,6 +258,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_path", type=str)
     parser.add_argument("--data_path", type=str)
     parser.add_argument("--dataset", type=str)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
 
     parser.add_argument("--batch_cost", type=int, default=DEFAULT_BATCH_COST)
     parser.add_argument("--dataset_split", type=str, default=DEFAULT_DATASET_SPLIT)

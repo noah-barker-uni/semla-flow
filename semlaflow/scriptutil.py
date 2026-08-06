@@ -153,7 +153,7 @@ def init_metrics(data_path, model):
     return metrics, stability_metrics
 
 
-def generate_molecules(model, dm, steps, strategy, stabilities=False):
+def generate_molecules(model, dm, steps, strategy, stabilities=False, record_trajectory=False):
     test_dl = dm.test_dataloader()
     model.eval()
     cuda_model = model.to("cuda")
@@ -161,7 +161,7 @@ def generate_molecules(model, dm, steps, strategy, stabilities=False):
     outputs = []
     for batch in tqdm(test_dl):
         batch = {k: v.cuda() for k, v in batch[0].items()}
-        output = cuda_model._generate(batch, steps, strategy)
+        output = cuda_model._generate(batch, steps, strategy, record_trajectory=record_trajectory)
         outputs.append(output)
 
     molecules = [cuda_model._generate_mols(output) for output in outputs]
