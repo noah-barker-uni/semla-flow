@@ -16,6 +16,7 @@ from semlaflow.models.semla import EquiInvDynamics, SemlaGenerator
 
 DEFAULT_DATASET = "geom-drugs"
 DEFAULT_ARCH = "semla"
+DEFAULT_SEED = 12345
 
 DEFAULT_D_MODEL = 384
 DEFAULT_N_LAYERS = 12
@@ -362,7 +363,7 @@ def main(args):
     if args.resume_ckpt_path is not None and not Path(args.resume_ckpt_path).exists():
         raise FileNotFoundError(f"resume_ckpt_path '{args.resume_ckpt_path}' does not exist.")
 
-    L.seed_everything(12345)
+    L.seed_everything(args.seed)
     util.disable_lib_stdout()
     util.configure_fs()
 
@@ -394,6 +395,7 @@ if __name__ == "__main__":
     # Setup args
     parser.add_argument("--data_path", type=str)
     parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--trial_run", action="store_true")
     parser.add_argument("--resume_ckpt_path", type=str, default=None)
     parser.add_argument("--run_name", type=str, default=None)
