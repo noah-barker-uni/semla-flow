@@ -64,9 +64,25 @@ class GeometricInterpolantCouplingTests(unittest.TestCase):
             self.assertEqual(from_mol.seq_length, to_mol.seq_length)
             self.assertFalse(torch.isnan(from_mol.coords).any().item())
 
-    def test_sinkhorn_coupling_composes_with_batch_ot(self):
-        interpolant = _build_interpolant(coupling="sinkhorn", kabsch_align=False, batch_ot=True, fixed_time=0.5)
-        to_mols = _sample_to_mols(n_mols=3, n_atoms=4)
+    def test_sinkhorn_coupling_with_batch_ot_raises(self):
+        with self.assertRaises(ValueError):
+            _build_interpolant(coupling="sinkhorn", batch_ot=True)
+
+    def test_sinkhorn_coupling_handles_varied_molecule_sizes(self):
+        # Exercises the padded/masked batching in _sinkhorn_couple, not just the same-size case
+        interpolant = _build_interpolant(coupling="sinkhorn", kabsch_align=True, fixed_time=0.5)
+        to_mols = _sample_to_mols_varied([4, 6, 5])
+
+        from_mols, returned_to_mols, interp_mols, times = interpolant.interpolate(to_mols)
+
+        self.assertEqual(len(from_mols), len(to_mols))
+        for from_mol, to_mol in zip(from_mols, returned_to_mols):
+            self.assertEqual(from_mol.seq_length, to_mol.seq_length)
+            self.assertFalse(torch.isnan(from_mol.coords).any().item())
+
+    def test_sinkhorn_coupling_without_kabsch_runs(self):
+        interpolant = _build_interpolant(coupling="sinkhorn", kabsch_align=False, fixed_time=0.5)
+        to_mols = _sample_to_mols_varied([3, 5])
 
         from_mols, returned_to_mols, interp_mols, times = interpolant.interpolate(to_mols)
 

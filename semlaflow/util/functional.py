@@ -495,6 +495,57 @@ def sinkhorn(cost_matrix: torch.Tensor, eps: float, n_iters: int = 100) -> torch
     return torch.exp(log_plan)
 
 
+# Cost added to any (row, col) pair where either side is a padding position, so it gets ~0
+# probability regardless of eps -- large enough that exp(-SINKHORN_MASK_COST / eps) underflows
+# to 0 even at the largest eps used (t near 0, eps close to 1), but finite so logsumexp never
+# sees an actual inf/nan.
+SINKHORN_MASK_COST = 1e6
+
+
+def sinkhorn_batched(cost: torch.Tensor, node_mask: torch.Tensor, eps: torch.Tensor, n_iters: int = 100) -> torch.Tensor:
+    """Batched version of sinkhorn() -- one plan per batch element, computed as vectorised tensor
+    ops across the whole batch rather than a Python loop calling sinkhorn() once per element.
+
+    Molecules in a batch have different real sizes, so this pads to the batch's max size and
+    masks out any (row, col) pair touching a padding position via node_mask, the same masking
+    convention used by mcmc_permutation.
+
+    Args:
+        cost (torch.Tensor): Padded cost matrix, shape [B, N, N].
+        node_mask (torch.Tensor): Shape [B, N], 1 for real (non-padding) positions.
+        eps (torch.Tensor): Per-batch-element temperature, shape [B]. Must be > 0.
+        n_iters (int): Number of alternating row/col normalisation steps.
+
+    Returns:
+        torch.Tensor: Shape [B, N, N]. For the real n_b x n_b submatrix of each batch element,
+            rows and cols sum to ~1; values touching padding positions are meaningless and
+            should be sliced away, not used directly.
+    """
+
+    batch_size, n = node_mask.shape
+    if cost.shape != (batch_size, n, n):
+        raise ValueError(f"cost must have shape ({batch_size}, {n}, {n}), got {tuple(cost.shape)}.")
+
+    if (eps <= 0).any():
+        raise ValueError("eps must be > 0 for every batch element.")
+
+    valid = adj_from_node_mask(node_mask, self_connect=True).bool()
+    masked_cost = cost.masked_fill(~valid, SINKHORN_MASK_COST)
+
+    eps_row = eps.view(batch_size, 1)
+    eps_mat = eps.view(batch_size, 1, 1)
+
+    f = torch.zeros(batch_size, n, dtype=cost.dtype, device=cost.device)
+    g = torch.zeros(batch_size, n, dtype=cost.dtype, device=cost.device)
+
+    for _ in range(n_iters):
+        f = -eps_row * torch.logsumexp((g.unsqueeze(1) - masked_cost) / eps_mat, dim=2)
+        g = -eps_row * torch.logsumexp((f.unsqueeze(2) - masked_cost) / eps_mat, dim=1)
+
+    log_plan = (f.unsqueeze(2) + g.unsqueeze(1) - masked_cost) / eps_mat
+    return torch.exp(log_plan)
+
+
 def mcmc_permutation(
     cost: torch.Tensor,
     node_mask: torch.Tensor,

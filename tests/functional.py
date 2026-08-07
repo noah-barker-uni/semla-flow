@@ -577,5 +577,84 @@ class MCMCPermutationFnsTests(unittest.TestCase):
             smolF.mcmc_permutation(cost, node_mask, eps=torch.ones(2), n_iters=5, init_perm=init_perm, proposal="knn")
 
 
+class SinkhornBatchedFnsTests(unittest.TestCase):
+    def _random_batch(self, seq_lengths, seed):
+        torch.manual_seed(seed)
+        batch_size = len(seq_lengths)
+        n = max(seq_lengths)
+        seq_lengths_t = torch.tensor(seq_lengths)
+        to_coords = torch.rand((batch_size, n, 3))
+        from_coords = torch.rand((batch_size, n, 3))
+        node_mask = (torch.arange(n).unsqueeze(0) < seq_lengths_t.unsqueeze(1)).long()
+        cost = smolF.inter_distances(to_coords, from_coords, sqrd=True)
+        return cost, node_mask, seq_lengths_t
+
+    def test_real_submatrix_rows_and_cols_sum_to_one(self):
+        cost, node_mask, seq_lengths = self._random_batch([5, 3, 6], seed=0)
+        eps = torch.full((3,), 0.1)
+
+        plan = smolF.sinkhorn_batched(cost, node_mask, eps, n_iters=1000)
+
+        for b in range(3):
+            n_b = seq_lengths[b].item()
+            sub = plan[b, :n_b, :n_b]
+            np.testing.assert_almost_equal(torch.ones(n_b).tolist(), sub.sum(dim=1).tolist(), decimal=2)
+            np.testing.assert_almost_equal(torch.ones(n_b).tolist(), sub.sum(dim=0).tolist(), decimal=2)
+
+    def test_matches_unbatched_sinkhorn_when_no_padding(self):
+        cost, node_mask, seq_lengths = self._random_batch([5, 5], seed=1)
+        eps = torch.full((2,), 0.2)
+
+        batched = smolF.sinkhorn_batched(cost, node_mask, eps, n_iters=200)
+        for b in range(2):
+            unbatched = smolF.sinkhorn(cost[b], eps[b].item(), n_iters=200)
+            np.testing.assert_almost_equal(unbatched.tolist(), batched[b].tolist(), decimal=4)
+
+    def test_converges_to_hungarian_as_eps_shrinks(self):
+        cost, node_mask, seq_lengths = self._random_batch([5, 5], seed=2)
+        eps = torch.full((2,), 1e-3)  # matches COUPLING_MIN_EPS, the real floor used in training
+
+        plan = smolF.sinkhorn_batched(cost, node_mask, eps, n_iters=3000)
+
+        for b in range(2):
+            n_b = seq_lengths[b].item()
+            row_ind, col_ind = linear_sum_assignment(cost[b, :n_b, :n_b].numpy())
+            exp_hard_plan = np.zeros((n_b, n_b))
+            exp_hard_plan[row_ind, col_ind] = 1.0
+            np.testing.assert_almost_equal(exp_hard_plan, plan[b, :n_b, :n_b].numpy(), decimal=2)
+
+    def test_padding_does_not_leak_into_real_submatrix(self):
+        # Same molecule (n_b=4) once alone (no padding) and once inside a batch padded up to n=7
+        torch.manual_seed(3)
+        to_coords = torch.rand((4, 3))
+        from_coords = torch.rand((4, 3))
+        cost_small = smolF.inter_distances(to_coords, from_coords, sqrd=True)
+
+        cost_padded = torch.zeros((1, 7, 7))
+        cost_padded[0, :4, :4] = cost_small
+        node_mask = torch.zeros((1, 7), dtype=torch.long)
+        node_mask[0, :4] = 1
+
+        eps = torch.full((1,), 0.15)
+        plan_padded = smolF.sinkhorn_batched(cost_padded, node_mask, eps, n_iters=1000)
+        plan_small = smolF.sinkhorn_batched(
+            cost_small.unsqueeze(0), torch.ones((1, 4), dtype=torch.long), eps, n_iters=1000
+        )
+
+        np.testing.assert_almost_equal(
+            plan_small[0].numpy(), plan_padded[0, :4, :4].numpy(), decimal=2
+        )
+
+    def test_rejects_non_positive_eps(self):
+        cost, node_mask, seq_lengths = self._random_batch([4, 4], seed=4)
+        with self.assertRaises(ValueError):
+            smolF.sinkhorn_batched(cost, node_mask, eps=torch.tensor([0.1, 0.0]))
+
+    def test_rejects_mismatched_cost_shape(self):
+        cost, node_mask, seq_lengths = self._random_batch([4, 4], seed=5)
+        with self.assertRaises(ValueError):
+            smolF.sinkhorn_batched(cost[:, :, :-1], node_mask, eps=torch.ones(2))
+
+
 if __name__ == "__main__":
     unittest.main()

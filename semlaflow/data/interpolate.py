@@ -194,6 +194,13 @@ class GeometricInterpolant(Interpolant):
                 "needs a per-pair coupling callable evaluated over all B^2 candidate pairs."
             )
 
+        if coupling == "sinkhorn" and batch_ot:
+            raise ValueError(
+                "coupling='sinkhorn' cannot be combined with batch_ot=True: sinkhorn coupling runs as "
+                "a single batched pass over the current (from_mol, to_mol) pairing (see sinkhorn_batched), "
+                "whereas batch_ot needs a per-pair coupling callable evaluated over all B^2 candidate pairs."
+            )
+
         self.prior_sampler = prior_sampler
         self.coord_interpolation = coord_interpolation
         self.type_interpolation = type_interpolation
@@ -257,10 +264,14 @@ class GeometricInterpolant(Interpolant):
 
         times_list = times.tolist()
 
-        # mcmc coupling needs its own batched pass over the whole minibatch (see _mcmc_couple);
-        # it cannot be combined with batch_ot (enforced in __init__)
+        # mcmc and sinkhorn coupling each need their own batched pass over the whole minibatch
+        # (see _mcmc_couple / _sinkhorn_couple); neither can be combined with batch_ot (enforced
+        # in __init__)
         if self.coupling == "mcmc":
             from_mols = self._mcmc_couple(from_mols, to_mols, times_list)
+
+        elif self.coupling == "sinkhorn":
+            from_mols = self._sinkhorn_couple(from_mols, to_mols, times_list)
 
         # Choose best possible matches for the whole batch if using batch OT
         elif self.batch_ot:
@@ -300,7 +311,11 @@ class GeometricInterpolant(Interpolant):
         return best_from_mols
 
     def _match_mols(self, from_mol: GeometricMol, to_mol: GeometricMol, t: Optional[float] = None) -> GeometricMol:
-        """Couple the from_mol to the to_mol (hard or soft), optionally Kabsch-align, and return the result"""
+        """Couple the from_mol to the to_mol (none or hard), optionally Kabsch-align, and return the result
+
+        Soft couplings (sinkhorn, mcmc) are not handled here -- they need their own batched pass
+        over the whole minibatch, see _sinkhorn_couple / _mcmc_couple.
+        """
 
         if to_mol.seq_length > from_mol.seq_length:
             raise RuntimeError("from_mol must have at least as many atoms as to_mol.")
@@ -320,15 +335,6 @@ class GeometricInterpolant(Interpolant):
             _, from_mol_indices = linear_sum_assignment(cost_matrix.numpy())
             from_mol = from_mol.permute(from_mol_indices.tolist())
 
-        elif self.coupling == "sinkhorn":
-            if t is None:
-                raise ValueError("t must be provided to use sinkhorn coupling.")
-
-            # Diffuse early in the trajectory, sharpen onto the Hungarian answer as t -> 1
-            eps = max((1.0 - t) ** 2, COUPLING_MIN_EPS)
-            plan = smolF.sinkhorn(cost_matrix, eps, n_iters=self.sinkhorn_n_iters)
-            from_mol = from_mol.soft_permute(plan)
-
         if not self.kabsch_align:
             return from_mol
 
@@ -343,6 +349,47 @@ class GeometricInterpolant(Interpolant):
 
         rotation, _ = Rotation.align_vectors(to_mol_coords, from_mol_coords)
         return from_mol.rotate(rotation)
+
+    def _sinkhorn_couple(
+        self, from_mols: list[GeometricMol], to_mols: list[GeometricMol], times: list[float]
+    ) -> list[GeometricMol]:
+        """Couple each from_mol to its to_mol via batched Sinkhorn-Knopp, one pass over the whole batch.
+
+        A per-molecule Python loop calling sinkhorn() once per molecule works but does not scale:
+        at production batch sizes it means thousands of individual small torch ops executed inside
+        a forked DataLoader worker process, which is a known trigger for native segfaults under
+        PyTorch/OpenMP thread-pool-after-fork issues (this is what was actually happening -- see
+        commit history). Batching mirrors _mcmc_couple's approach: pad to a single [B, N, N] cost
+        tensor and run all n_iters iterations across the whole batch at once.
+        """
+
+        # Keep the same number of atoms as the data mol in the noise mol, same as _match_mols
+        trunc_from_mols = [
+            from_mol.permute(list(range(to_mol.seq_length))) for from_mol, to_mol in zip(from_mols, to_mols)
+        ]
+
+        seq_lengths = torch.tensor([to_mol.seq_length for to_mol in to_mols])
+        to_coords = smolF.pad_tensors([to_mol.coords.cpu() for to_mol in to_mols])
+        from_coords = smolF.pad_tensors([from_mol.coords.cpu() for from_mol in trunc_from_mols])
+        n_pad = seq_lengths.max().item()
+        node_mask = (torch.arange(n_pad).unsqueeze(0) < seq_lengths.unsqueeze(1)).long()
+
+        cost = smolF.inter_distances(to_coords, from_coords, sqrd=True)
+
+        # Diffuse early in the trajectory, sharpen onto the Hungarian answer as t -> 1
+        eps = torch.clamp((1.0 - torch.tensor(times)) ** 2, min=COUPLING_MIN_EPS)
+
+        plan = smolF.sinkhorn_batched(cost, node_mask, eps, n_iters=self.sinkhorn_n_iters)
+
+        result = [
+            trunc_from_mols[b].soft_permute(plan[b, :n_b, :n_b])
+            for b, n_b in enumerate(seq_lengths.tolist())
+        ]
+
+        if self.kabsch_align:
+            result = [self._kabsch_align(from_mol, to_mol) for from_mol, to_mol in zip(result, to_mols)]
+
+        return result
 
     def _mcmc_couple(
         self, from_mols: list[GeometricMol], to_mols: list[GeometricMol], times: list[float]
