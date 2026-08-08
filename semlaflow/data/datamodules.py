@@ -11,6 +11,23 @@ from semlaflow.data.util import BucketBatchSampler
 from semlaflow.util.molrepr import GeometricMol, GeometricMolBatch
 
 
+def _worker_init_single_thread(worker_id):
+    """Force each forked DataLoader worker to run torch single-threaded.
+
+    Collation calls interpolant code, and soft couplings (sinkhorn) do matmuls there. On aarch64
+    a large enough matmul dispatches to ARM Compute Library's multithreaded GEMM, which calls
+    GOMP_parallel to spawn an OpenMP thread team. libgomp is not fork-safe, so building a team
+    inside a forked worker segfaults -- confirmed from a core dump, crashing in gomp_team_start
+    under einsum -> bmm -> mkldnn_matmul -> arm_compute::OMPScheduler. Single-threaded workers
+    never create a team, so the crash site is unreachable.
+
+    This is also just correct regardless: one worker per CPU each spawning its own OpenMP team is
+    massive thread oversubscription.
+    """
+
+    torch.set_num_threads(1)
+
+
 class SmolDM(L.LightningDataModule):
     def __init__(
         self,
@@ -82,6 +99,7 @@ class SmolDM(L.LightningDataModule):
             shuffle=shuffle,
             batch_sampler=sampler,
             num_workers=self._num_workers,
+            worker_init_fn=_worker_init_single_thread,
             pin_memory=True,
             collate_fn=partial(self._collate, dataset="train"),
         )
@@ -97,6 +115,7 @@ class SmolDM(L.LightningDataModule):
             shuffle=False,
             batch_sampler=sampler,
             num_workers=self._num_workers,
+            worker_init_fn=_worker_init_single_thread,
             collate_fn=partial(self._collate, dataset="val"),
         )
         return dataloader
@@ -111,6 +130,7 @@ class SmolDM(L.LightningDataModule):
             shuffle=False,
             batch_sampler=sampler,
             num_workers=self._num_workers,
+            worker_init_fn=_worker_init_single_thread,
             collate_fn=partial(self._collate, dataset="test"),
         )
         return dataloader
