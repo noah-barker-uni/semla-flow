@@ -312,6 +312,7 @@ def build_dm(args, vocab):
         bucket_limits=padded_sizes,
         bucket_cost_scale=args.bucket_cost_scale,
         pad_to_bucket=False,
+        num_workers=args.num_workers,
     )
     return dm
 
@@ -417,6 +418,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--batch_cost", type=int, default=DEFAULT_BATCH_COST)
+    parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--acc_batches", type=int, default=DEFAULT_ACC_BATCHES)
     parser.add_argument("--gradient_clip_val", type=float, default=DEFAULT_GRADIENT_CLIP_VAL)
     parser.add_argument("--type_loss_weight", type=float, default=DEFAULT_TYPE_LOSS_WEIGHT)

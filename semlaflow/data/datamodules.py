@@ -38,6 +38,7 @@ class SmolDM(L.LightningDataModule):
         bucket_limits=None,
         bucket_cost_scale="constant",
         pad_to_bucket=False,
+        num_workers=None,
     ):
         super().__init__()
 
@@ -57,7 +58,7 @@ class SmolDM(L.LightningDataModule):
             if test_dataset is not None and max(test_dataset.lengths) > largest_padding:
                 raise ValueError("At least one item in test dataset is larger than largest padded size.")
 
-        self._num_workers = len(os.sched_getaffinity(0))
+        self._num_workers = len(os.sched_getaffinity(0)) if num_workers is None else num_workers
 
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
@@ -266,6 +267,7 @@ class GeometricInterpolantDM(GeometricDM):
         bucket_limits=None,
         bucket_cost_scale=None,
         pad_to_bucket=False,
+        num_workers=None,
     ):
 
         self.train_interpolant = train_interpolant
@@ -280,6 +282,7 @@ class GeometricInterpolantDM(GeometricDM):
             bucket_limits=bucket_limits,
             bucket_cost_scale=bucket_cost_scale,
             pad_to_bucket=pad_to_bucket,
+            num_workers=num_workers,
         )
 
     @property
