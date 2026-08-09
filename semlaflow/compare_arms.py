@@ -29,10 +29,12 @@ from semlaflow.evaluate import dm_from_ckpt, load_model
 from semlaflow.util.paired_eval import (
     per_molecule_energy,
     per_molecule_opt_rmsd,
+    per_molecule_posebusters,
     per_molecule_stability,
     per_molecule_strain_energy,
     per_molecule_trajectory_straightness,
     per_molecule_validity,
+    per_molecule_x1_movement,
 )
 
 DEFAULT_DATASET_SPLIT = "test"
@@ -79,10 +81,12 @@ def _generate_arm(args, ckpt_path, vocab):
     )
 
     straightness = []
+    x1_movement = []
     for output in outputs:
         straightness.extend(per_molecule_trajectory_straightness(output["trajectory"], output["mask"]))
+        x1_movement.extend(per_molecule_x1_movement(output["x1_trajectory"], output["mask"]))
 
-    return molecules, straightness
+    return molecules, straightness, x1_movement
 
 
 def _load_reference_mols(args, vocab):
@@ -102,6 +106,7 @@ def _collect_per_molecule(molecules):
     atom_stable_frac, mol_stable = per_molecule_stability(molecules)
     return {
         "validity": per_molecule_validity(molecules, connected=True),
+        "posebusters-valid": per_molecule_posebusters(molecules),
         "atom-stable-frac": atom_stable_frac,
         "mol-stable": mol_stable,
         "energy-per-atom": per_molecule_energy(molecules, per_atom=True),
@@ -149,15 +154,17 @@ def _stratified_means(values, buckets, bucket_limits):
 
 def compare(args, vocab):
     print(f"Generating {args.n_molecules} molecules for arm A ({args.label_a})...")
-    molecules_a, straightness_a = _generate_arm(args, args.ckpt_path_a, vocab)
+    molecules_a, straightness_a, x1_movement_a = _generate_arm(args, args.ckpt_path_a, vocab)
 
     print(f"Generating {args.n_molecules} molecules for arm B ({args.label_b})...")
-    molecules_b, straightness_b = _generate_arm(args, args.ckpt_path_b, vocab)
+    molecules_b, straightness_b, x1_movement_b = _generate_arm(args, args.ckpt_path_b, vocab)
 
     per_mol_a = _collect_per_molecule(molecules_a)
     per_mol_a["trajectory-straightness"] = straightness_a
+    per_mol_a["x1-movement"] = x1_movement_a
     per_mol_b = _collect_per_molecule(molecules_b)
     per_mol_b["trajectory-straightness"] = straightness_b
+    per_mol_b["x1-movement"] = x1_movement_b
 
     bucket_limits = util.QM9_BUCKET_LIMITS if args.dataset == "qm9" else util.GEOM_DRUGS_BUCKET_LIMITS
     buckets_a = _size_buckets(molecules_a, bucket_limits)

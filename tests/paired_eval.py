@@ -78,6 +78,25 @@ class PairedEvalTests(unittest.TestCase):
         for value in valid_values:
             self.assertGreaterEqual(value, 0.0)
 
+    def test_per_molecule_posebusters_matches_raw_bust_aggregate(self):
+        from posebusters import PoseBusters
+
+        mols_with_none = [self.mols[0], None, self.mols[1]]
+
+        per_mol = paired_eval.per_molecule_posebusters(mols_with_none)
+
+        self.assertEqual(3, len(per_mol))
+        self.assertIsNone(per_mol[1])
+
+        report = PoseBusters(config="mol").bust([self.mols[0], self.mols[1]], None, None)
+        expected = report.fillna(False).all(axis=1).tolist()
+        self.assertEqual(expected[0], per_mol[0])
+        self.assertEqual(expected[1], per_mol[2])
+
+    def test_per_molecule_posebusters_all_none_input(self):
+        per_mol = paired_eval.per_molecule_posebusters([None, None])
+        self.assertEqual([None, None], per_mol)
+
     def test_per_molecule_stability_matches_calc_atom_stabilities(self):
         mols_with_none = [self.mols[0], None, self.mols[2]]
 
@@ -158,6 +177,60 @@ class TrajectoryStraightnessTests(unittest.TestCase):
         mask = torch.ones(3, 3, dtype=torch.long)
         with self.assertRaises(ValueError):
             paired_eval.per_molecule_trajectory_straightness(trajectory, mask)
+
+
+class X1MovementTests(unittest.TestCase):
+    def test_constant_prediction_has_zero_movement(self):
+        n_atoms, n_steps = 4, 6
+        prediction = torch.randn(1, 1, n_atoms, 3).expand(1, n_steps, n_atoms, 3)
+        mask = torch.ones(1, n_atoms, dtype=torch.long)
+
+        movement = paired_eval.per_molecule_x1_movement(prediction, mask)
+
+        self.assertEqual(1, len(movement))
+        self.assertAlmostEqual(0.0, movement[0], places=5)
+
+    def test_known_per_step_displacement_averages_correctly(self):
+        # Single atom, moves by a vector of norm 1 at each of 3 steps -> mean displacement 1.0
+        step_vec = torch.tensor([1.0, 0.0, 0.0])
+        x1_trajectory = torch.stack([torch.zeros(3), step_vec, step_vec * 2, step_vec * 3])
+        x1_trajectory = x1_trajectory.view(1, 4, 1, 3)
+        mask = torch.ones(1, 1, dtype=torch.long)
+
+        movement = paired_eval.per_molecule_x1_movement(x1_trajectory, mask)
+
+        self.assertAlmostEqual(1.0, movement[0], places=5)
+
+    def test_padding_atoms_do_not_affect_result(self):
+        torch.manual_seed(2)
+        n_real, n_pad, n_steps = 3, 2, 5
+        n_total = n_real + n_pad
+
+        real_pred = torch.randn(1, n_steps, n_real, 3)
+        pad_pred = torch.randn(1, n_steps, n_pad, 3) * 1000
+        full_pred = torch.cat([real_pred, pad_pred], dim=2)
+
+        mask = torch.zeros(1, n_total, dtype=torch.long)
+        mask[0, :n_real] = 1
+
+        movement_full = paired_eval.per_molecule_x1_movement(full_pred, mask)
+        movement_real_only = paired_eval.per_molecule_x1_movement(real_pred, torch.ones(1, n_real, dtype=torch.long))
+
+        self.assertAlmostEqual(movement_real_only[0], movement_full[0], places=5)
+
+    def test_fewer_than_two_steps_returns_none(self):
+        prediction = torch.randn(1, 1, 3, 3)
+        mask = torch.ones(1, 3, dtype=torch.long)
+
+        movement = paired_eval.per_molecule_x1_movement(prediction, mask)
+
+        self.assertIsNone(movement[0])
+
+    def test_mismatched_shapes_raise(self):
+        prediction = torch.zeros(2, 5, 3, 3)
+        mask = torch.ones(3, 3, dtype=torch.long)
+        with self.assertRaises(ValueError):
+            paired_eval.per_molecule_x1_movement(prediction, mask)
 
 
 if __name__ == "__main__":

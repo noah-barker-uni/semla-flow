@@ -892,10 +892,19 @@ class MolecularCFM(L.LightningModule):
         # makes an eventual absolute path-length number meaningful too)
         trajectory = [curr["coords"].clone()] if record_trajectory else None
 
+        # The model's own raw per-step prediction of the endpoint (X-hat_1), ie. "coords" below
+        # before the integrator moves curr towards it -- distinct from `trajectory`, which is the
+        # *realized*, integrated path. One entry per step (not steps+1: there's no X-hat_1 prediction
+        # before the first model call).
+        x1_trajectory = [] if record_trajectory else None
+
         with torch.no_grad():
             for step_size in step_sizes:
                 cond = cond_batch if self.self_condition else None
                 coords, type_logits, bond_logits, charge_logits = self(curr, times, training=False, cond_batch=cond)
+
+                if record_trajectory:
+                    x1_trajectory.append(coords.clone())
 
                 type_probs = F.softmax(type_logits, dim=-1)
                 bond_probs = F.softmax(bond_logits, dim=-1)
@@ -923,6 +932,7 @@ class MolecularCFM(L.LightningModule):
         predicted["coords"] = predicted["coords"] * self.coord_scale
         if record_trajectory:
             predicted["trajectory"] = torch.stack(trajectory, dim=1) * self.coord_scale
+            predicted["x1_trajectory"] = torch.stack(x1_trajectory, dim=1) * self.coord_scale
 
         return predicted
 
