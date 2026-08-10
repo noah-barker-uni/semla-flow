@@ -10,7 +10,7 @@ from lightning.pytorch.loggers import WandbLogger
 import semlaflow.scriptutil as util
 from semlaflow.data.datamodules import GeometricInterpolantDM
 from semlaflow.data.datasets import GeometricDataset
-from semlaflow.data.interpolate import GeometricInterpolant, GeometricNoiseSampler
+from semlaflow.data.interpolate import COUPLING_TYPES, GeometricInterpolant, GeometricNoiseSampler
 from semlaflow.models.fm import Integrator, MolecularCFM
 from semlaflow.models.semla import EquiInvDynamics, SemlaGenerator
 
@@ -54,10 +54,6 @@ DEFAULT_TIME_BETA = 1.0
 DEFAULT_OPTIMAL_TRANSPORT = "none"
 DEFAULT_COUPLING = "hungarian"
 DEFAULT_KABSCH_ALIGN = True
-DEFAULT_SINKHORN_N_ITERS = 100
-DEFAULT_MCMC_N_ITERS = 100
-DEFAULT_MCMC_PROPOSAL = "knn"
-DEFAULT_MCMC_KNN_K = 8
 
 
 def build_model(args, dm, vocab):
@@ -282,10 +278,6 @@ def build_dm(args, vocab):
         type_dist_temp=args.type_dist_temp,
         coupling=args.coupling,
         kabsch_align=args.kabsch_align,
-        sinkhorn_n_iters=args.sinkhorn_n_iters,
-        mcmc_n_iters=args.mcmc_n_iters,
-        mcmc_proposal=args.mcmc_proposal,
-        mcmc_knn_k=args.mcmc_knn_k,
         batch_ot=batch_ot,
         time_alpha=args.time_alpha,
         time_beta=args.time_beta,
@@ -444,16 +436,10 @@ if __name__ == "__main__":
     parser.add_argument("--time_alpha", type=float, default=DEFAULT_TIME_ALPHA)
     parser.add_argument("--time_beta", type=float, default=DEFAULT_TIME_BETA)
     parser.add_argument("--optimal_transport", type=str, default=DEFAULT_OPTIMAL_TRANSPORT)
-    parser.add_argument(
-        "--coupling", type=str, default=DEFAULT_COUPLING, choices=["none", "hungarian", "sinkhorn", "mcmc"]
-    )
+    parser.add_argument("--coupling", type=str, default=DEFAULT_COUPLING, choices=COUPLING_TYPES)
     parser.add_argument(
         "--kabsch_align", action=argparse.BooleanOptionalAction, default=DEFAULT_KABSCH_ALIGN
     )
-    parser.add_argument("--sinkhorn_n_iters", type=int, default=DEFAULT_SINKHORN_N_ITERS)
-    parser.add_argument("--mcmc_n_iters", type=int, default=DEFAULT_MCMC_N_ITERS)
-    parser.add_argument("--mcmc_proposal", type=str, default=DEFAULT_MCMC_PROPOSAL, choices=["uniform", "knn"])
-    parser.add_argument("--mcmc_knn_k", type=int, default=DEFAULT_MCMC_KNN_K)
 
     parser.set_defaults(
         trial_run=False,
