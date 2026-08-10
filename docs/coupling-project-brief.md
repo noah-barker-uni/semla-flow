@@ -9,6 +9,108 @@ Two focused deep-dives exist alongside this and are absorbed into it — `docs/e
 analysis). This document is the one to read first.
 
 Repo: fork of `rssrwn/semla-flow` → `noah-barker-uni/semla-flow`, branch `sinkhorn-coupling`.
+Upstream branch point is `3f43103`; `git diff 3f43103 HEAD` shows everything described here.
+
+---
+
+## 0. Everything changed from stock SemlaFlow
+
+Complete inventory against the upstream branch point. ~3100 insertions, ~48 deletions across 25
+files. Upstream code is otherwise untouched — the architecture, the Semla layers, the data
+pipeline and the sampler are all stock.
+
+### The one breaking CLI change
+
+**`--optimal_transport equivariant` no longer exists.** Upstream bundled the permutation and the
+rotation together behind a single `equivariant_ot` boolean inside `_match_mols`. Since this project
+needs to vary the permutation while holding rotation fixed (the coupling × Kabsch 2×2), that bundle
+was decomposed into two independent flags:
+
+| Upstream | This fork |
+|---|---|
+| `--optimal_transport equivariant` | `--optimal_transport none --coupling hungarian --kabsch_align` |
+
+`--optimal_transport` now accepts only `none` / `batch` / `scale`; per-atom coupling moved to
+`--coupling` and `--kabsch_align`. `DEFAULT_OPTIMAL_TRANSPORT` changed `"equivariant"` → `"none"`
+to match, and `equivariant_ot` was removed from `GeometricInterpolant.__init__`.
+
+**Defaults still reproduce upstream behaviour.** Fork defaults are `--optimal_transport none
+--coupling hungarian --kabsch_align`, which is Hungarian-then-Kabsch — exactly what upstream's
+default `equivariant` did. Anyone running stock commands gets stock behaviour, but the flag they
+would type is different. SemlaFlow's "scale OT" is untouched and held fixed across all arms; it is
+orthogonal to the claim.
+
+### New files
+
+| File | Purpose |
+|---|---|
+| `semlaflow/util/paired_eval.py` | per-molecule metrics, PoseBusters, straightness, X̂₁ movement |
+| `semlaflow/util/geometry_metrics.py` | bond/angle/torsion extraction + Wasserstein distances |
+| `semlaflow/compare_arms.py` | paired two-checkpoint comparison script |
+| `semlaflow/__init__.py` | OpenMP env-var fix (was empty upstream) |
+| `tests/*.py` | 86 tests — none existed upstream for any of this |
+| `CLAUDE.md`, `docs/*.md` | project context and these briefs |
+
+### Modified files
+
+**`semlaflow/util/functional.py`** — added `sinkhorn`, `sinkhorn_batched`, `mcmc_permutation`,
+`SINKHORN_MASK_COST`. Nothing existing changed. See §3, §4.
+
+**`semlaflow/data/interpolate.py`** — the main change. `equivariant_ot` replaced by `coupling` +
+`kabsch_align`; `_match_mols` rewritten to branch on coupling and to early-return for `none`;
+Kabsch split out into its own `_kabsch_align`; new `_sinkhorn_couple` and `_mcmc_couple` batched
+paths; `COUPLING_MIN_EPS` / `COUPLING_TYPES` added. Times are now sampled *before* matching (soft
+couplings need `t`), and `_match_mols` / `_ot_map` take an optional `t`.
+
+**`semlaflow/util/molrepr.py`** — added `GeometricMol.soft_permute`. Existing `permute` untouched.
+
+**`semlaflow/models/fm.py`** — `_generate` gained `record_trajectory=False`, recording
+`predicted["trajectory"]` (realised path) and `predicted["x1_trajectory"]` (X̂₁ predictions), and
+raising `NotImplementedError` if combined with `self.distill`. No change to training or sampling
+behaviour when the flag is off.
+
+**`semlaflow/util/metrics.py`** — the valency-table correction, 8 lines:
+
+```python
+"C": {0: [3, 4], 1: 3, -1: 3}          →   "C": {0: 4, 1: 3, -1: 3}
+"N": {0: [2, 3], 1: [2,3,4], -1: 2}    →   "N": {0: 3, 1: [2,3,4], -1: 2}
+```
+
+Neutral carbon could previously pass at valence 3 and neutral nitrogen at valence 2 — an
+aromatic-bond-order rounding bug named in Nikitin et al. ("GEOM-Drugs Revisited",
+arXiv 2505.00169), which lists this codebase as affected. RDKit's `GetExplicitValence()` already
+resolves aromaticity correctly, so neutral C/N should only ever be 4/3. **This makes stability
+numbers strictly stricter than SemlaFlow's published figures** — see §7.
+
+**`semlaflow/train.py`** — new flags `--seed`, `--run_name`, `--resume_ckpt_path`,
+`--num_workers`, `--coupling`, `--kabsch_align`, `--sinkhorn_n_iters`, `--mcmc_n_iters`,
+`--mcmc_proposal`, `--mcmc_knn_k`. `L.seed_everything(12345)` → `L.seed_everything(args.seed)`.
+wandb runs are now named (`name=run_name`) instead of getting random IDs, and checkpoints go to
+`checkpoints/<run_name>/` instead of a shared directory — without this, parallel arms overwrite
+each other. `trainer.fit` passes `ckpt_path=args.resume_ckpt_path`, with an upfront existence
+check so a typo fails immediately rather than silently starting from scratch.
+
+**`semlaflow/evaluate.py`, `semlaflow/predict.py`** — `--seed` added, hardcoded
+`L.seed_everything(12345)` replaced. Default preserves prior behaviour exactly. This matters
+beyond tidiness: it is what makes the `compare_arms` pairing an explicit protocol rather than an
+accident of two scripts happening to share a constant (see §6).
+
+**`semlaflow/scriptutil.py`** — `generate_molecules` gained a pass-through `record_trajectory`
+argument. Two lines.
+
+**`semlaflow/data/datamodules.py`** — `num_workers` parameter added to `SmolDM` /
+`GeometricInterpolantDM` (was hardcoded `len(os.sched_getaffinity(0))`), plus
+`_worker_init_single_thread` wired as `worker_init_fn` on all three dataloaders. Both are aarch64
+segfault mitigations; see §7.
+
+**`environment.yaml`** — added `posebusters`. **`.gitignore`** — added `venv/`, `checkpoints/`.
+
+### Not changed
+
+The Semla architecture, the equivariant layers, the ODE sampler and integrator, the data
+preprocessing, the aggregate `Metric` classes, and SemlaFlow's scale-OT are all stock.
+`paired_eval.py` deliberately calls the *same* RDKit helpers the aggregate metrics use rather than
+reimplementing them, so the two paths cannot drift.
 
 ---
 
@@ -64,6 +166,8 @@ COUPLING_TYPES = ["none", "hungarian", "sinkhorn", "mcmc"]
 
 ### CLI surface (`train.py`)
 
+All of these are new in this fork (see §0).
+
 | Flag | Default | Notes |
 |---|---|---|
 | `--coupling` | `hungarian` | one of `none`/`hungarian`/`sinkhorn`/`mcmc` |
@@ -72,11 +176,14 @@ COUPLING_TYPES = ["none", "hungarian", "sinkhorn", "mcmc"]
 | `--mcmc_n_iters` | 100 | |
 | `--mcmc_proposal` | `knn` | or `uniform` |
 | `--mcmc_knn_k` | 8 | |
-| `--seed` | — | drives everything, including the eval pairing |
-| `--run_name` | — | names the wandb run and `checkpoints/<run_name>/` |
+| `--seed` | 12345 | drives everything, including the eval pairing |
+| `--run_name` | `None` | falls back to the coupling name; sets wandb run name and `checkpoints/<run_name>/` |
+| `--resume_ckpt_path` | `None` | resumes training; validated for existence upfront |
+| `--num_workers` | `None` | `None` = one per available CPU; `0` disables forking (aarch64 fallback, §7) |
 
 Kabsch is a **separate, orthogonal flag** from the coupling method, deliberately, so the 2×2
-(coupling × rotation-alignment) ablation in the experimental design is possible.
+(coupling × rotation-alignment) ablation in the experimental design is possible. Upstream bundled
+the two together as `--optimal_transport equivariant`, which no longer exists — see §0.
 
 ### Dispatch (`interpolate.py:253-292`)
 
@@ -444,19 +551,26 @@ for the posterior-mean hypothesis. That confound is unresolved and matters for t
 
 ## 10. File map
 
-| Path | Contents |
-|---|---|
-| `semlaflow/util/functional.py` | `sinkhorn`, `sinkhorn_batched`, `mcmc_permutation`, `inter_distances`, `adj_from_node_mask` |
-| `semlaflow/data/interpolate.py` | `GeometricInterpolant`, `_sinkhorn_couple`, `_mcmc_couple`, `_match_mols`, `_kabsch_align` |
-| `semlaflow/util/molrepr.py` | `GeometricMol.permute` / `.soft_permute` |
-| `semlaflow/util/metrics.py` | aggregate torchmetrics classes, `ALLOWED_VALENCIES` |
-| `semlaflow/util/paired_eval.py` | per-molecule metrics, PoseBusters, straightness, X̂₁ movement |
-| `semlaflow/util/geometry_metrics.py` | bond/angle/torsion extraction + Wasserstein |
-| `semlaflow/compare_arms.py` | paired comparison script |
-| `semlaflow/evaluate.py` | absolute single-checkpoint evaluation |
-| `semlaflow/models/fm.py` | `_generate` (trajectory recording), loss, training-time metrics |
-| `semlaflow/__init__.py` | the OpenMP env-var fix — must run before torch import |
-| `docs/evaluation.md`, `docs/sinkhorn-coupling-variant.md` | focused deep-dives |
+**N** = new in this fork, **M** = modified from upstream, **—** = stock.
+
+| Path | | Contents |
+|---|---|---|
+| `semlaflow/util/functional.py` | M | `sinkhorn`, `sinkhorn_batched`, `mcmc_permutation` added |
+| `semlaflow/data/interpolate.py` | M | `GeometricInterpolant`, `_sinkhorn_couple`, `_mcmc_couple`, `_match_mols`, `_kabsch_align` |
+| `semlaflow/util/molrepr.py` | M | `.soft_permute` added; `.permute` stock |
+| `semlaflow/util/metrics.py` | M | aggregate torchmetrics classes; `ALLOWED_VALENCIES` corrected |
+| `semlaflow/models/fm.py` | M | `_generate` trajectory recording added; loss/metrics stock |
+| `semlaflow/train.py` | M | new CLI flags, named runs, per-run checkpoint dirs, resume |
+| `semlaflow/evaluate.py`, `predict.py` | M | `--seed` only |
+| `semlaflow/scriptutil.py` | M | `record_trajectory` pass-through only |
+| `semlaflow/data/datamodules.py` | M | `num_workers`, single-thread `worker_init_fn` |
+| `semlaflow/util/paired_eval.py` | N | per-molecule metrics, PoseBusters, straightness, X̂₁ movement |
+| `semlaflow/util/geometry_metrics.py` | N | bond/angle/torsion extraction + Wasserstein |
+| `semlaflow/compare_arms.py` | N | paired comparison script |
+| `semlaflow/__init__.py` | N | the OpenMP env-var fix — must run before torch import |
+| `tests/*.py` | N | 86 tests |
+| `docs/evaluation.md`, `docs/sinkhorn-coupling-variant.md` | N | focused deep-dives |
+| `semlaflow/models/semla.py`, `data/datasets.py`, `preprocess.py` | — | stock, untouched |
 
 Tests: 86 total, CPU-only, `python -m unittest -v tests/*.py`. Breakdown: `functional.py` 34,
 `paired_eval.py` 25, `interpolate.py` 13, `molrepr.py` 7, `geometry_metrics.py` 7.
