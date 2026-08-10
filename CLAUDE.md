@@ -26,7 +26,8 @@ compact Lie group); the permutation case does not, hence the estimators above.
 ## THE TWO AXES — read this before touching coupling code
 
 The single most important structural fact about this project. There are two **independent**
-axes, and the code currently conflates them (see "Known defects" below):
+axes. The original implementation conflated them; both are now separate flags, `--coupling` and
+`--target`.
 
 | Axis | What it decides | Legal values | Why |
 |---|---|---|---|
@@ -34,7 +35,8 @@ axes, and the code currently conflates them (see "Known defects" below):
 | **Target** | given x_t, what to regress toward | hard / soft-averaged / sampled | blending is correct here |
 
 **Sinkhorn and MCMC belong on the target axis, not the coupling axis.**
-After the fix: coupling axis holds `{none, hungarian}`; target axis holds `{hard, sinkhorn, mcmc}`.
+Coupling axis holds `{none, hungarian}`; target axis holds `{hard, sinkhorn}`, with `mcmc`
+reserved.
 
 ### Why blending the noise is invalid (specification error, not approximation error)
 
@@ -54,7 +56,7 @@ x1-correlation.
 
 ### Why blending the target IS correct
 
-The model uses an x1-prediction parameterisation (`fm.py:745`). The Bayes-optimal x1-predictor is
+The model uses an x1-prediction parameterisation (`fm.py:_loss`). The Bayes-optimal x1-predictor is
 `E[x1 | x_t]` — a posterior mean, i.e. a blend. Squared-error regression converges to it anyway.
 
 - Blending the **input** (x_t) corrupts the distribution the model trains on. Pure damage.
@@ -62,8 +64,8 @@ The model uses an x1-prediction parameterisation (`fm.py:745`). The Bayes-optima
   Variance reduction, not corruption.
 
 The "averaged atom positions land inside bonds / non-physical molecule" worry is **wrong** — do
-not reintroduce it. `eps = (1-t)^2 -> 0` sharpens P onto a single permutation as t -> 1, so the
-endpoint target is always a real molecule.
+not reintroduce it. The temperature falls with t, sharpening P onto a single permutation, so the
+endpoint target is a real molecule.
 
 ### Why MCMC belongs on the target axis too
 
@@ -80,17 +82,21 @@ the target only through its mean.
 ### The posterior, stated correctly
 
 ```
-w(pi') ∝ exp( -||x_t - t * pi'(x1)||^2 / (2 (1-t)^2) )
+w(pi') ∝ exp( -||x_t - t * pi'(x1)||^2 / (2 * var) ),    var = Var(x_t | x1, t)
 ```
 
-Two things this fixes versus the current wiring:
-
-1. **Cost must be computed from x_t**, not from raw x0/x1. `interpolate.py:377` currently uses
-   `inter_distances(to_coords, from_coords)`, which is t-independent, with t bolted on afterwards
-   as a temperature. That is not the posterior. The correct cost is between the *current state*
-   x_t and each candidate `t * pi'(x1)`; `eps = (1-t)^2` then arises naturally as the conditional
-   path's own variance rather than being imposed. No free hyperparameter either way.
-2. **The target becomes `P @ x1`** — coordinates, plus one-hot atomics / bond types as soft labels.
+1. **The cost is computed from x_t**, not from raw x0/x1: `cost[i,j] = ||x_t[i] - t*x1[j]||^2`,
+   rows indexing x_t slots and columns x1 candidates. A t-independent cost with t bolted on as a
+   temperature is not the posterior.
+2. **The temperature is the conditional path's own variance**, so there is no free hyperparameter.
+   `x_t = (1-t)x0 + t*x1 + sigma*z` gives `var = (1-t)^2 + sigma^2`, and since sinkhorn is
+   parameterised by `P ~ exp(-cost/eps)`, **`eps = 2 * var`**. The corrections doc's prose says
+   `(1-t)^2`, dropping both the factor of 2 its own formula implies and the interpolant's
+   `coord_noise_std`. Consequence: with the default sigma=0.2, eps floors at 0.08 rather than
+   reaching 0, so blending vanishes at t->1 not because eps->0 but because the cost gap between
+   distinct atoms (~1 in scaled units) swamps it. **`--coord_noise_std_dev` now enters the
+   schedule and must be held fixed across all arms.**
+3. **The target becomes `P @ x1`** — coordinates, plus atomics / bonds / charges as soft labels.
 
 ## Important correctness constraints
 
@@ -112,7 +118,7 @@ Two things this fixes versus the current wiring:
   was already good. **Log the entropy of P as a function of t** so the amount of actual blending
   is visible rather than assumed.
 
-## Known defects in the current code (not yet fixed)
+## Defects found in the original implementation, and how each was settled
 
 Authoritative source: `docs/Sinkhorn_corrections.md` (`docs/evaluation_corrections.md` is a
 verbatim copy of its sections 4-7). Where anything conflicts with the older
@@ -125,24 +131,35 @@ to *where* Sinkhorn is applied, not to how it is implemented.
    removed from the coupling dispatch and `COUPLING_TYPES` is now `["none", "hungarian"]`. The
    solvers in `functional.py` and `molrepr.py:soft_permute` are untouched — they are correct and
    the target side needs them.
-2. **[TODO] There is no target axis yet.** Add `--target {hard,sinkhorn,mcmc}` (default `hard`),
-   independent of `--coupling`, computed **in the loss** where x_t is available. `soft_permute`
-   is then applied to `to_mols`, not `from_mols`. This is where the four removed hyperparameters
-   (`sinkhorn_n_iters`, `mcmc_n_iters`, `mcmc_proposal`, `mcmc_knn_k`) come back — they were
-   deleted with the dispatch rather than left dangling; recover them from
-   `git show HEAD~1:semlaflow/data/interpolate.py` when wiring the target side.
-3. **[TODO] The cost must be computed from x_t.** The removed code used
-   `inter_distances(to_coords, from_coords)`, which is t-independent, with t bolted on afterwards
-   as a temperature. See "The posterior, stated correctly" above. Do not reproduce that when
-   rebuilding on the target axis.
-4. **[TODO] The eps clamp was binding.** `COUPLING_MIN_EPS = 1e-3` was removed with the dead code,
-   but the question it raises must be settled when the schedule is rebuilt: at t=0.99 the measured
-   eps read 1e-3 where (1-0.99)^2 = 1e-4, and `sum_j P_ij^2 = 0.896` showed the plan still mixing
-   ~1.12 atoms where it should be essentially hard, so the intended t->1 sharpening was not
-   happening. The solver is already log-space (`functional.py:460`), which is exactly what removes
-   the underflow that motivates such a clamp. Do not reintroduce a clamp without establishing it
-   is needed — an undocumented hyperparameter doing real work is something reviewers will ask
-   about.
+2. **[FIXED] The target axis now exists.** `--target {hard,sinkhorn}` (default `hard`), independent
+   of `--coupling`, computed in the loss via `fm.py:permutation_target`. `mcmc` is the reserved
+   third value and is not implemented yet — recover its removed hyperparameters from
+   `git show d1c18eb~1:semlaflow/data/interpolate.py` when wiring it. `molrepr.py:soft_permute`
+   stays as the single-molecule reference; the loss uses its own batched `fm.py:apply_plan`, and
+   `tests/functional.py` pins the two against each other so their conventions cannot drift.
+3. **[FIXED] The cost is computed from x_t.** `cost[b,i,j] = ||x_t[b,i] - t*x1[b,j]||^2`, rows
+   indexing x_t slots and columns x1 candidates. Not the old t-independent
+   `inter_distances(to_coords, from_coords)` with t bolted on as a temperature.
+4. **[SETTLED] The eps clamp is gone and is not coming back.** The schedule is now
+   `eps = 2((1-t)^2 + sigma^2)`, the conditional path's own variance (sigma = `coord_noise_std`),
+   with the factor of 2 the corrections doc's prose dropped. `TARGET_MIN_EPS = 1e-5` in `fm.py` is
+   **not** the old clamp: a floored eps only keeps `sinkhorn_batched`'s `eps > 0` check legal, and
+   the resulting plan is then *discarded* in favour of the identity — which is the exact eps -> 0
+   limit, since x_t -> x1 as t -> 1 makes the identity the argmin. So nothing is ever blended at a
+   floored temperature, which is precisely what the old clamp did wrong. Its value comes from
+   float32 conditioning, not taste, and `train-target-eps` / `train-target-hard-fallback-frac` are
+   logged so a binding floor would be visible immediately rather than inferred years later.
+5. **[FIXED, worth knowing] Sinkhorn's rows were the unconverged marginal.** The solver loop ends
+   on the column update, so `sum_i P_ij = 1` holds identically at any iteration count while the
+   ROW sums — the ones a posterior-mean target reads — are only approximate. At the 100 iterations
+   a training step affords, the worst row is off by ~1e-2, which would have shrunk that atom's
+   coordinate target toward the origin by 1% — the contraction artifact, reintroduced on the target
+   side through a convergence bug. `functional.py:plan_from_sinkhorn` renormalises rows and logs
+   the pre-normalisation deviation as `train-target-row-sum-dev`.
+6. **[FIXED] The bond diagonal needed the single-index marginal.** `(P B P^T)_ii` treats sigma(i)
+   as two independent draws, but on the diagonal both indices are the *same* draw, so the exact
+   answer is `sum_j P_ij B_jj` — the self-bond row transforms like any node feature. `_bond_loss`
+   does train on the diagonal (`adj_from_node_mask(..., self_connect=True)`), so this matters.
 
 ### All existing Sinkhorn/MCMC numbers are uninterpretable
 
@@ -156,17 +173,6 @@ can game.** The geometry regression then follows from the train/test mismatch. T
 hypothesis, by contrast, predicts straighter paths *and* equal-or-better geometry.
 
 **Keep the runs, relabel them exploratory, do not delete, do not cite as evidence.**
-
-### The control that settles it (one training run)
-
-Hungarian coupling, hard target, noise artificially scaled to match the measured contraction:
-`x0 -> c(t) * x0` with `c(t) = sqrt(sum_j P_ij^2)`, i.e. ~0.62 at t=0 rising to ~0.95 at t=0.99.
-
-- Reproduces the straightness gain -> the effect was contraction, coupling interpretation dead.
-- Does not reproduce it -> something real was happening and should survive into the fixed
-  implementation.
-
-Either outcome is informative.
 
 ### What to keep unchanged
 
@@ -317,10 +323,13 @@ Next, in priority order:
 
 1. [done] **Sinkhorn and MCMC removed from the coupling dispatch.**
        `COUPLING_TYPES = ["none","hungarian"]`; solvers and `soft_permute` kept.
-2. [ ] **Add the target axis.** `--target {hard,sinkhorn,mcmc}` computed in the loss, cost from
-       x_t, eps schedule with the clamp question settled. Unit-test as before: as eps -> 0 the
-       soft plan converges to scipy's `linear_sum_assignment`; rows/cols sum to 1; log-space
-       stable at small eps. Add an entropy-of-P-vs-t log.
+2. [done] **Target axis added** — `--target {hard,sinkhorn}`, cost from x_t,
+       `eps = 2((1-t)^2 + sigma^2)`, entropy-of-P-vs-t logged per epoch. `--target mcmc` is the
+       remaining piece: same cost and eps, `init_perm` = identity (x_t was built from x1 in index
+       order, so the identity IS the permutation that generated it — no scipy call needed in the
+       loss), `to_coords` = x_t coords for the knn proposal. Profile step time before any real run:
+       100 sequential tiny GPU kernels is a measurable overhead, and if the chain barely moves at
+       low t it is a hard arm in disguise and must be reported as one.
 3. [ ] **NFE sweep** {1,2,5,10,20,50,100}. Highest-value missing experiment: the mechanism
        predicts the gap *widens* at low NFE and nothing tests that. Everything so far ran at a
        fixed 100 steps; `--integration_steps` already exists on both scripts, so this is a sweep
@@ -328,12 +337,11 @@ Next, in priority order:
        vs NFE with a zero line, so "the gap widens" is the literal shape of the curve; (c) "NFE
        required to reach threshold tau" as a single interpretable number.
 4. [ ] **GFN2-xTB pipeline** (see Metrics). New dependency, unverified on aarch64.
-5. [ ] **The contraction control run** (see Known defects).
-6. [ ] **Ryser estimator-bias comparison at n <= 12** — exact permanent marginals vs Sinkhorn vs
+5. [ ] **Ryser estimator-bias comparison at n <= 12** — exact permanent marginals vs Sinkhorn vs
        MCMC on real cost matrices from the training loop. Cheap (CPU-seconds), disproportionate
        credibility: quantifies the mean-field bias the argument rests on instead of asserting it.
-7. [ ] **Target-variance diagnostic** (see Key plots).
-8. [ ] **GEOM-Drugs** — everything so far is QM9.
+6. [ ] **Target-variance diagnostic** (see Key plots).
+7. [ ] **GEOM-Drugs** — everything so far is QM9.
 
 ## Experimental design
 
@@ -353,7 +361,7 @@ Core factorial:
 | **No coupling** | floor | isolates target effect | isolates target effect |
 | **Hungarian coupling** | Klein et al. baseline | **proposed** | **proposed** |
 
-Plus the contraction control. Three seeds throughout.
+Three seeds throughout.
 
 Expected interaction, worth pre-stating as a prediction: the soft target is a *local* average over
 permutations near the one that built x_t. A good coupling puts that neighbourhood somewhere

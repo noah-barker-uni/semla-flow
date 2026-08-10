@@ -11,7 +11,7 @@ import semlaflow.scriptutil as util
 from semlaflow.data.datamodules import GeometricInterpolantDM
 from semlaflow.data.datasets import GeometricDataset
 from semlaflow.data.interpolate import COUPLING_TYPES, GeometricInterpolant, GeometricNoiseSampler
-from semlaflow.models.fm import Integrator, MolecularCFM
+from semlaflow.models.fm import TARGET_TYPES, Integrator, MolecularCFM
 from semlaflow.models.semla import EquiInvDynamics, SemlaGenerator
 
 DEFAULT_DATASET = "geom-drugs"
@@ -54,6 +54,8 @@ DEFAULT_TIME_BETA = 1.0
 DEFAULT_OPTIMAL_TRANSPORT = "none"
 DEFAULT_COUPLING = "hungarian"
 DEFAULT_KABSCH_ALIGN = True
+DEFAULT_TARGET = "hard"
+DEFAULT_TARGET_SINKHORN_ITERS = 100
 
 
 def build_model(args, dm, vocab):
@@ -185,6 +187,11 @@ def build_model(args, dm, vocab):
         train_smiles=train_smiles,
         type_mask_index=type_mask_index,
         bond_mask_index=bond_mask_index,
+        target=args.target,
+        # The target temperature is the conditional path's own variance, which includes the
+        # interpolant's coord noise -- so the model must be told the sigma actually in use
+        target_noise_std=args.coord_noise_std_dev,
+        target_sinkhorn_iters=args.target_sinkhorn_iters,
         **hparams,
     )
     return fm_model
@@ -315,7 +322,7 @@ def build_trainer(args):
     val_check_epochs = 1 if args.trial_run else args.val_check_epochs
 
     project_name = f"{util.PROJECT_PREFIX}-{args.dataset}"
-    run_name = args.run_name if args.run_name is not None else args.coupling
+    run_name = args.run_name if args.run_name is not None else f"{args.coupling}-{args.target}"
     print("Using precision '32'")
 
     logger = WandbLogger(project=project_name, name=run_name, save_dir="wandb", log_model=True)
@@ -355,6 +362,13 @@ def main(args):
 
     if args.resume_ckpt_path is not None and not Path(args.resume_ckpt_path).exists():
         raise FileNotFoundError(f"resume_ckpt_path '{args.resume_ckpt_path}' does not exist.")
+
+    if args.optimal_transport == "scale" and args.target != "hard":
+        raise ValueError(
+            "--optimal_transport scale rescales the prior by a per-molecule factor, so the "
+            "conditional path variance that the soft target's temperature is derived from no "
+            "longer holds. Use --optimal_transport none with a non-hard --target."
+        )
 
     L.seed_everything(args.seed)
     util.disable_lib_stdout()
@@ -440,6 +454,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--kabsch_align", action=argparse.BooleanOptionalAction, default=DEFAULT_KABSCH_ALIGN
     )
+    parser.add_argument("--target", type=str, default=DEFAULT_TARGET, choices=TARGET_TYPES)
+    parser.add_argument("--target_sinkhorn_iters", type=int, default=DEFAULT_TARGET_SINKHORN_ITERS)
 
     parser.set_defaults(
         trial_run=False,

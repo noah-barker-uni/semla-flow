@@ -546,6 +546,56 @@ def sinkhorn_batched(cost: torch.Tensor, node_mask: torch.Tensor, eps: torch.Ten
     return torch.exp(log_plan)
 
 
+def plan_from_sinkhorn(
+    plan: torch.Tensor, node_mask: torch.Tensor, renormalise: bool = True, eps: float = 1e-12
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Turn a raw sinkhorn_batched output into a usable row-stochastic transport plan.
+
+    Two things sinkhorn_batched does not do for you:
+
+    1. Its padding rows/cols are documented as meaningless. This forces P = blockdiag(real_plan, I)
+       -- any (real, pad) or (pad, real) entry is zeroed and every padding row gets an exact 1 on
+       its diagonal -- so P @ x reproduces x's zero padding rows byte for byte.
+
+    2. Its loop ends on the column update, so sum_i P_ij == 1 holds identically at any iteration
+       count while the ROW sums are only approximate. Anything reading rows (a posterior-mean
+       target is sum_j P_ij x_j, a per-row conditional expectation) therefore gets scaled by the
+       row's convergence error: a row summing to 1 - d shrinks that row's target towards the
+       origin by d. That is the same contraction artifact the coupling-side sinkhorn produced, so
+       it is renormalised away rather than tolerated.
+
+    Row-normalising gives up sum_i P_ij == 1. That is the right trade: the target's semantics only
+    need each row to be a probability distribution, and column-stochasticity is a property of the
+    exact posterior marginal that a mean-field estimator does not have anyway.
+
+    Args:
+        plan (torch.Tensor): Raw plan from sinkhorn_batched, shape [B, N, N].
+        node_mask (torch.Tensor): Shape [B, N], 1 for real (non-padding) positions.
+        renormalise (bool): Divide each row by its sum so rows sum to exactly 1.
+        eps (float): Floor on the row sum divisor, guarding against an all-zero row.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: (plan [B, N, N], row_sum_deviation [B]), where
+            row_sum_deviation[b] is max_i |sum_j P_ij - 1| measured BEFORE renormalisation, ie a
+            direct convergence diagnostic for the solver.
+    """
+
+    batch_size, n = node_mask.shape
+    if plan.shape != (batch_size, n, n):
+        raise ValueError(f"plan must have shape ({batch_size}, {n}, {n}), got {tuple(plan.shape)}.")
+
+    valid = adj_from_node_mask(node_mask, self_connect=True).to(plan.dtype)
+    pad_diag = torch.diag_embed(1.0 - node_mask.to(plan.dtype))
+    plan = (plan * valid) + pad_diag
+
+    row_dev = (plan.sum(dim=2) - 1.0).abs().amax(dim=1)
+
+    if renormalise:
+        plan = plan / plan.sum(dim=2, keepdim=True).clamp_min(eps)
+
+    return plan, row_dev
+
+
 def mcmc_permutation(
     cost: torch.Tensor,
     node_mask: torch.Tensor,

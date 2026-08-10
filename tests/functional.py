@@ -656,5 +656,77 @@ class SinkhornBatchedFnsTests(unittest.TestCase):
             smolF.sinkhorn_batched(cost[:, :, :-1], node_mask, eps=torch.ones(2))
 
 
+class PlanFromSinkhornFnsTests(unittest.TestCase):
+    def _random_plan(self, seq_lengths, seed, n_iters=1000, eps_val=0.1):
+        torch.manual_seed(seed)
+        batch_size = len(seq_lengths)
+        n = max(seq_lengths)
+        seq_lengths_t = torch.tensor(seq_lengths)
+        to_coords = torch.rand((batch_size, n, 3))
+        from_coords = torch.rand((batch_size, n, 3))
+        node_mask = (torch.arange(n).unsqueeze(0) < seq_lengths_t.unsqueeze(1)).long()
+        cost = smolF.inter_distances(to_coords, from_coords, sqrd=True)
+        eps = torch.full((batch_size,), eps_val)
+        raw = smolF.sinkhorn_batched(cost, node_mask, eps, n_iters=n_iters)
+        return raw, node_mask, seq_lengths_t
+
+    def test_padding_rows_become_identity(self):
+        raw, node_mask, seq_lengths = self._random_plan([5, 3, 6], seed=0)
+
+        plan, _ = smolF.plan_from_sinkhorn(raw, node_mask)
+
+        for b in range(3):
+            for i in range(seq_lengths[b].item(), node_mask.size(1)):
+                self.assertEqual(plan[b, i, i].item(), 1.0)
+                self.assertEqual(plan[b, i, :].sum().item(), 1.0)
+
+    def test_cross_terms_between_real_and_padding_are_zero(self):
+        raw, node_mask, seq_lengths = self._random_plan([5, 3, 6], seed=1)
+
+        plan, _ = smolF.plan_from_sinkhorn(raw, node_mask)
+
+        n = node_mask.size(1)
+        for b in range(3):
+            n_b = seq_lengths[b].item()
+            self.assertEqual(plan[b, :n_b, n_b:].abs().sum().item(), 0.0)
+            self.assertEqual(plan[b, n_b:, :n_b].abs().sum().item(), 0.0)
+
+    def test_rows_sum_to_one_even_when_unconverged(self):
+        # 5 iterations is deliberately nowhere near converged, which is the regime a training step
+        # actually runs in -- the row sums are the marginal sinkhorn_batched leaves approximate.
+        raw, node_mask, seq_lengths = self._random_plan([5, 3, 6], seed=2, n_iters=5, eps_val=0.01)
+
+        plan, row_dev = smolF.plan_from_sinkhorn(raw, node_mask)
+
+        self.assertGreater(row_dev.max().item(), 1e-3)
+        np.testing.assert_almost_equal(
+            plan.sum(dim=2).numpy(), torch.ones_like(plan.sum(dim=2)).numpy(), decimal=6
+        )
+
+    def test_row_deviation_is_small_once_converged(self):
+        # The floor here is float32 precision, not iteration count -- 2000 iters gives ~5e-4 and
+        # 5000 gives ~2e-4. At the 100 iters a training step actually affords it is ~1e-2, which
+        # is why the renormalisation above is load-bearing rather than cosmetic.
+        raw, node_mask, seq_lengths = self._random_plan([5, 3, 6], seed=3, n_iters=2000)
+
+        _, row_dev = smolF.plan_from_sinkhorn(raw, node_mask)
+
+        self.assertLess(row_dev.max().item(), 1e-3)
+
+    def test_renormalise_disabled_leaves_rows_unnormalised(self):
+        raw, node_mask, seq_lengths = self._random_plan([5, 3], seed=4, n_iters=5, eps_val=0.01)
+
+        plan, row_dev = smolF.plan_from_sinkhorn(raw, node_mask, renormalise=False)
+
+        np.testing.assert_almost_equal(
+            (plan.sum(dim=2) - 1.0).abs().amax(dim=1).numpy(), row_dev.numpy(), decimal=6
+        )
+
+    def test_rejects_mismatched_plan_shape(self):
+        raw, node_mask, seq_lengths = self._random_plan([4, 4], seed=5)
+        with self.assertRaises(ValueError):
+            smolF.plan_from_sinkhorn(raw[:, :, :-1], node_mask)
+
+
 if __name__ == "__main__":
     unittest.main()

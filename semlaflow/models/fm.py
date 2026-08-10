@@ -19,6 +19,233 @@ from semlaflow.util.tokeniser import Vocabulary
 _T = torch.Tensor
 _BatchT = dict[str, _T]
 
+# "mcmc" -- an unbiased single sample from the same posterior -- is the planned third value and is
+# deliberately not listed until it is implemented, same discipline as COUPLING_TYPES.
+TARGET_TYPES = ["hard", "sinkhorn"]
+
+# Number of t buckets the plan-entropy-vs-t curve is accumulated into over an epoch.
+TARGET_T_BINS = 10
+
+# Temperature below which the entropic plan is replaced by its exact zero-temperature limit.
+#
+# This is NOT the removed COUPLING_MIN_EPS clamp (see docs/Sinkhorn_corrections.md 3.4). That clamp
+# floored eps and then kept blending at the floored value, so the intended t -> 1 sharpening
+# silently never happened. Here a floored eps exists only to keep sinkhorn_batched's eps > 0 check
+# legal, and the resulting plan is THROWN AWAY and replaced by the identity -- which is the exact
+# eps -> 0 limit of the plan, because as t -> 1 we have x_t -> x1 and the argmin permutation of the
+# cost is then the identity (atoms of a real molecule are never coincident). So the schedule is
+# exact everywhere it is used, and exactly right where it is not.
+#
+# The value is set by float32 conditioning, not by taste. The solver forms (f_i + g_j - c_ij) / eps
+# with f, g = O(max cost) ~ O(1e2), so that exponent carries absolute error ~ 2^-24 * 1e2 = 1e-5,
+# and exp() overflows once 1e-5 / eps > 88, ie around eps ~ 1e-7. 1e-5 leaves two orders of
+# margin. Under the default schedule (which includes the coord noise floor) it never fires at all;
+# train-target-hard-fallback-frac is logged so that stays visible rather than assumed.
+TARGET_MIN_EPS = 1e-5
+
+
+@torch.no_grad()
+def permutation_target(
+    data: _BatchT,
+    interpolated: _BatchT,
+    times: _T,
+    target: str,
+    noise_std: float = 0.0,
+    sinkhorn_iters: int = 100,
+    eps_override: Optional[_T] = None,
+) -> tuple[_BatchT, dict[str, _T]]:
+    """Build the regression target the model is trained against, given the current state x_t.
+
+    The hard target is x1 itself. The soft target is the posterior mean over permutations,
+
+        w(pi') ~ exp( -||x_t - t * pi'(x1)||^2 / (2 * var) ),    var = Var(x_t | x1, t)
+
+    estimated by sinkhorn. This is legitimate precisely where soft-permuting the PRIOR was not: the
+    model is x1-parameterised, so the Bayes-optimal target is E[x1 | x_t], a posterior mean. See
+    docs/Sinkhorn_corrections.md.
+
+    The temperature is not a free hyperparameter -- it is the conditional path's own variance. With
+    x_t = (1-t) x0 + t x1 + noise_std * z, that is var = (1-t)^2 + noise_std^2, and since sinkhorn
+    is parameterised by P ~ exp(-cost / eps), eps = 2 * var.
+
+    Two documented approximations:
+      - The likelihood uses coordinates only, though x_t's categorical channels are also informative
+        about pi' under unmask interpolation. This biases the plan more diffuse. The hungarian
+        coupling is coords-only for the same reason.
+      - The posterior is exact only under coupling="none". Under a coupling, x0 was selected to be
+        close to x1, so the true conditional residual is smaller than var predicts and the analytic
+        temperature is too large -- again more diffuse. Measured by the eps-ratio diagnostic rather
+        than corrected.
+
+    Args:
+        data (_BatchT): The data molecules x1, in their original (un-permuted) atom order.
+        interpolated (_BatchT): The interpolated state x_t.
+        times (_T): Interpolation times, shape [B].
+        target (str): One of TARGET_TYPES.
+        noise_std (float): The interpolant's coord_noise_std, part of the conditional variance.
+        sinkhorn_iters (int): Solver iterations.
+        eps_override (Optional[_T]): Shape [B]. Bypasses the schedule entirely. Exists so tests can
+            drive the temperature directly instead of inverting the schedule; not used in training.
+
+    Returns:
+        tuple[_BatchT, dict[str, _T]]: (target batch, per-batch diagnostics). For target="hard" the
+            data object itself is returned unchanged, with no tensor ops and no RNG consumed.
+    """
+
+    if target not in TARGET_TYPES:
+        raise ValueError(f"target '{target}' not supported. Accepted values: {TARGET_TYPES}.")
+
+    if target == "hard":
+        return data, {}
+
+    mask = data["mask"]
+    batch_size, n = mask.shape
+
+    if eps_override is not None:
+        eps = eps_override
+    else:
+        var = (1.0 - times).clamp_min(0.0).pow(2) + (noise_std ** 2)
+        eps = 2.0 * var
+
+    eps = eps.to(data["coords"].dtype)
+    soft_ok = eps >= TARGET_MIN_EPS
+
+    # Whole batch sits at the hard limit, so the limit IS the answer -- no solver call at all
+    if not bool(soft_ok.any()):
+        return data, _target_diagnostics(data, data, interpolated, None, times, eps, soft_ok, None)
+
+    # Rows index x_t slots, columns index x1 candidates. That orientation is what makes
+    # target = P @ x1 match GeometricMol.soft_permute's convention.
+    scaled_data_coords = times.view(-1, 1, 1) * data["coords"]
+    cost = smolF.inter_distances(interpolated["coords"], scaled_data_coords, sqrd=True)
+
+    raw_plan = smolF.sinkhorn_batched(cost, mask, eps.clamp_min(TARGET_MIN_EPS), n_iters=sinkhorn_iters)
+    plan, row_dev = smolF.plan_from_sinkhorn(raw_plan, mask)
+
+    # Discard any plan computed at a clamped temperature in favour of its exact limit
+    eye = torch.eye(n, dtype=plan.dtype, device=plan.device).expand(batch_size, n, n)
+    plan = torch.where(soft_ok.view(-1, 1, 1), plan, eye)
+
+    target_batch = apply_plan(plan, data)
+    diagnostics = _target_diagnostics(
+        target_batch, data, interpolated, plan, times, eps, soft_ok, row_dev
+    )
+    return target_batch, diagnostics
+
+
+def apply_plan(plan: _T, data: _BatchT) -> _BatchT:
+    """Apply a row-stochastic plan to every channel of a data batch jointly.
+
+    A permutation acts on coordinates, atom types, bond types and charges together, so a soft
+    permutation must too. Single-index channels are exact functions of the row marginals; the
+    pairwise bond channel additionally needs pairwise marginals, and P B P^T is the mean-field
+    approximation to those -- except on the diagonal, where the exact marginal is a point mass and
+    is restored below.
+
+    Args:
+        plan (_T): Row-stochastic plan, shape [B, N, N].
+        data (_BatchT): Batch to permute. Its mask is passed through unchanged.
+
+    Returns:
+        _BatchT: Soft-permuted batch. Discrete channels become soft labels.
+    """
+
+    coords = plan @ data["coords"]
+    atomics = plan @ data["atomics"]
+    charges = plan @ data["charges"].to(plan.dtype)
+
+    # Two chained two-operand einsums, never the three-operand form: torch.einsum does not
+    # guarantee a contraction order for three operands, and the naive order materialises
+    # [B, N, N, N, E] -- several GB at GEOM-Drugs sizes. molrepr.py's soft_permute gets away with
+    # the three-operand form only because it runs on one molecule at a time.
+    bonds = torch.einsum("bij,bjkc->bikc", plan, data["bonds"])
+    bonds = torch.einsum("blk,bikc->bilc", plan, bonds)
+
+    # (P B P^T)_ii = sum_{j,k} P_ij P_ik B_jk treats sigma(i) as two independent draws, but on the
+    # diagonal both indices are the SAME draw, so the exact marginal is just sum_j P_ij B_jj -- the
+    # self-bond row is a single-index quantity and transforms like any other node feature. Restore
+    # it exactly: _bond_loss does train on the diagonal, since adj_from_node_mask is built with
+    # self_connect=True.
+    diag = torch.einsum("bij,bjc->bic", plan, data["bonds"].diagonal(dim1=1, dim2=2).transpose(1, 2))
+    bonds = bonds.diagonal_scatter(diag.transpose(1, 2), dim1=1, dim2=2)
+
+    return {
+        "coords": coords,
+        "atomics": atomics,
+        "bonds": bonds,
+        "charges": charges,
+        "mask": data["mask"],
+    }
+
+
+def _target_diagnostics(
+    target: _BatchT,
+    data: _BatchT,
+    interpolated: _BatchT,
+    plan: Optional[_T],
+    times: _T,
+    eps: _T,
+    soft_ok: _T,
+    row_dev: Optional[_T],
+) -> dict[str, _T]:
+    """Per-step scalars describing how much blending actually happened.
+
+    x_t is built from the coupling's permutation and the posterior is then computed from x_t, so
+    the plan is peaked on that permutation by construction. That makes "is anything actually
+    blending" an empirical question rather than an assumption, which is what these measure.
+
+    Every value is a scalar except target-plan-entropy-per-sample, which is [B] so the caller can
+    accumulate the entropy-vs-t curve.
+    """
+
+    mask = data["mask"]
+    dtype = data["coords"].dtype
+    mask_f = mask.to(dtype)
+    n_real = mask_f.sum(dim=1).clamp_min(1.0)
+
+    # How far the analytic temperature is from the residual actually observed. ~1 means the
+    # gaussian posterior is well specified; < 1 means the coupling already pulled x0 towards x1, so
+    # the analytic variance overstates the real one and the plan is over-diffuse.
+    resid = (interpolated["coords"] - times.view(-1, 1, 1) * data["coords"]) * mask_f.unsqueeze(2)
+    measured_var = resid.pow(2).sum(dim=(1, 2)) / (3.0 * n_real)
+
+    diagnostics = {
+        "target-eps": eps.mean(),
+        "target-hard-fallback-frac": (~soft_ok).to(dtype).mean(),
+        "target-eps-ratio": (measured_var / (0.5 * eps).clamp_min(1e-12)).mean(),
+    }
+
+    if plan is None:
+        return diagnostics
+
+    if row_dev is not None:
+        diagnostics["target-row-sum-dev"] = row_dev.mean()
+
+    log_plan = plan.clamp_min(1e-12).log()
+    row_entropy = -(plan * log_plan).sum(dim=2)
+    norm_entropy = (row_entropy * mask_f).sum(dim=1) / (n_real * n_real.clamp_min(2.0).log())
+    eff_atoms = (mask_f / plan.pow(2).sum(dim=2).clamp_min(1e-12)).sum(dim=1) / n_real
+    plan_diag = (plan.diagonal(dim1=1, dim2=2) * mask_f).sum(dim=1) / n_real
+
+    coord_shift = ((target["coords"] - data["coords"]) * mask_f.unsqueeze(2)).pow(2).sum(dim=(1, 2))
+    coord_norm = (data["coords"] * mask_f.unsqueeze(2)).pow(2).sum(dim=(1, 2)).clamp_min(1e-12)
+
+    # CE against a soft label q is H(q) + KL(q||p). H(q) is a target-only constant that inflates
+    # the reported type/bond losses without touching gradients, so log it to keep the reported
+    # numbers comparable across arms.
+    label_entropy = -(target["atomics"] * target["atomics"].clamp_min(1e-12).log()).sum(dim=-1)
+    label_entropy = (label_entropy * mask_f).sum(dim=1) / n_real
+
+    diagnostics.update({
+        "target-plan-entropy": norm_entropy.mean(),
+        "target-eff-atoms": eff_atoms.mean(),
+        "target-plan-diag": plan_diag.mean(),
+        "target-coord-shift": (coord_shift / coord_norm).sqrt().mean(),
+        "target-label-entropy": label_entropy.mean(),
+        "target-plan-entropy-per-sample": norm_entropy,
+    })
+    return diagnostics
+
 
 class Integrator:
     def __init__(
@@ -385,6 +612,9 @@ class MolecularCFM(L.LightningModule):
         train_smiles: Optional[list[str]] = None,
         type_mask_index: Optional[int] = None,
         bond_mask_index: Optional[int] = None,
+        target: str = "hard",
+        target_noise_std: float = 0.0,
+        target_sinkhorn_iters: int = 100,
         **kwargs
     ):
         super().__init__()
@@ -404,6 +634,14 @@ class MolecularCFM(L.LightningModule):
 
         if distill and (type_strategy == "mask" or bond_strategy == "mask"):
             raise ValueError("Distilled training with masking strategy is not supported.")
+
+        if target not in TARGET_TYPES:
+            raise ValueError(f"target '{target}' not supported. Accepted values: {TARGET_TYPES}.")
+
+        # _distill_loss builds its own targets and uses KL rather than the shared CE path, so a
+        # soft target would only apply to half of it
+        if distill and target != "hard":
+            raise ValueError("Distilled training is only supported with target='hard'.")
 
         if lr_schedule == "one-cycle" and warm_up_steps is not None:
             print("Note: warm_up_steps is currently ignored if schedule is one-cycle")
@@ -427,6 +665,14 @@ class MolecularCFM(L.LightningModule):
         self.total_steps = total_steps
         self.type_mask_index = type_mask_index
         self.bond_mask_index = bond_mask_index
+        self.target = target
+        self.target_noise_std = target_noise_std
+        self.target_sinkhorn_iters = target_sinkhorn_iters
+
+        # persistent=False is load-bearing: these must never enter state_dict, or a checkpoint
+        # written by a soft arm stops loading in an arm that does not define them
+        self.register_buffer("_plan_entropy_sum", torch.zeros(TARGET_T_BINS), persistent=False)
+        self.register_buffer("_plan_entropy_count", torch.zeros(TARGET_T_BINS), persistent=False)
 
         builder = MolBuilder(vocab)
 
@@ -456,6 +702,9 @@ class MolecularCFM(L.LightningModule):
             "use_ema": use_ema,
             "compile_model": compile_model,
             "warm_up_steps": warm_up_steps,
+            "target": target,
+            "target_noise_std": target_noise_std,
+            "target_sinkhorn_iters": target_sinkhorn_iters,
             **gen.hparams,
             **integrator.hparams,
             **kwargs
@@ -588,7 +837,7 @@ class MolecularCFM(L.LightningModule):
             "charges": charges
         }
 
-        losses = self._loss(data, interpolated, predicted)
+        losses = self._loss(data, interpolated, predicted, times)
         loss = sum(list(losses.values()))
 
         for name, loss_val in losses.items():
@@ -601,6 +850,53 @@ class MolecularCFM(L.LightningModule):
     def on_train_batch_end(self, outputs, batch, b_idx):
         if self.ema_gen is not None:
             self.ema_gen.update_parameters(self.gen)
+
+    def on_train_epoch_end(self):
+        """Flush the plan-entropy-vs-t curve accumulated over the epoch.
+
+        Each step averages over a batch spanning many different t, so the entropy schedule is only
+        visible once binned by t -- which is the whole point of logging it.
+        """
+
+        if self.target == "hard":
+            return
+
+        means = self._plan_entropy_sum / self._plan_entropy_count.clamp_min(1.0)
+        for k in range(TARGET_T_BINS):
+            self.log(f"train-plan-entropy-t{k}", means[k], on_epoch=True, logger=True, sync_dist=True)
+
+        self._plan_entropy_sum.zero_()
+        self._plan_entropy_count.zero_()
+
+    def _regression_target(self, data, interpolated, times):
+        """Build the regression target and log how much blending it involved.
+
+        For target="hard" this returns the data object itself, having done no tensor work and
+        consumed no RNG -- so the hard arm stays bit-identical to the pre-target-axis baseline.
+        """
+
+        if self.target == "hard":
+            return data
+
+        target, diagnostics = permutation_target(
+            data,
+            interpolated,
+            times,
+            self.target,
+            noise_std=self.target_noise_std,
+            sinkhorn_iters=self.target_sinkhorn_iters,
+        )
+
+        entropy = diagnostics.pop("target-plan-entropy-per-sample", None)
+        if entropy is not None:
+            bins = (times * TARGET_T_BINS).long().clamp_(0, TARGET_T_BINS - 1)
+            self._plan_entropy_sum.index_add_(0, bins, entropy.to(self._plan_entropy_sum.dtype))
+            self._plan_entropy_count.index_add_(0, bins, torch.ones_like(entropy, dtype=self._plan_entropy_count.dtype))
+
+        for name, value in diagnostics.items():
+            self.log(f"train-{name}", value, on_step=True, logger=True)
+
+        return target
 
     def validation_step(self, batch, b_idx):
         prior, data, interpolated, times = batch
@@ -737,17 +1033,21 @@ class MolecularCFM(L.LightningModule):
     def _compile_model(self, model):
         return torch.compile(model, dynamic=False, fullgraph=True, mode="reduce-overhead")
 
-    def _loss(self, data, interpolated, predicted):
+    def _loss(self, data, interpolated, predicted, times):
+        target = self._regression_target(data, interpolated, times)
+
         pred_coords = predicted["coords"]
-        coords = data["coords"]
+        coords = target["coords"]
+
+        # From data, not target -- the mask is not permuted, and reading it from the original says so
         mask = data["mask"].unsqueeze(2)
 
         coord_loss = F.mse_loss(pred_coords, coords, reduction="none")
         coord_loss = (coord_loss * mask).mean(dim=(1, 2))
 
-        type_loss = self._type_loss(data, interpolated, predicted)
-        bond_loss = self._bond_loss(data, interpolated, predicted)
-        charge_loss = self._charge_loss(data, predicted)
+        type_loss = self._type_loss(target, interpolated, predicted)
+        bond_loss = self._bond_loss(target, interpolated, predicted)
+        charge_loss = self._charge_loss(target, predicted)
 
         coord_loss = coord_loss.mean()
         type_loss = type_loss.mean() * self.type_loss_weight
@@ -811,7 +1111,7 @@ class MolecularCFM(L.LightningModule):
         if self.type_strategy == "mse":
             type_loss = F.mse_loss(pred_logits, atomics_dist, reduction="none")
         else:
-            atomics = torch.argmax(atomics_dist, dim=-1).flatten(0, 1)
+            atomics = self._ce_target(atomics_dist, flatten_end=1)
             type_loss = F.cross_entropy(pred_logits.flatten(0, 1), atomics, reduction="none")
             type_loss = type_loss.unflatten(0, (batch_size, num_atoms)).unsqueeze(2)
 
@@ -829,10 +1129,10 @@ class MolecularCFM(L.LightningModule):
     def _bond_loss(self, data, interpolated, predicted, eps=1e-3):
         pred_logits = predicted["bonds"]
         mask = data["mask"]
-        bonds = torch.argmax(data["bonds"], dim=-1)
+        bonds = self._ce_target(data["bonds"], flatten_end=2)
         batch_size, num_atoms, _, _ = pred_logits.size()
 
-        bond_loss = F.cross_entropy(pred_logits.flatten(0, 2), bonds.flatten(0, 2), reduction="none")
+        bond_loss = F.cross_entropy(pred_logits.flatten(0, 2), bonds, reduction="none")
         bond_loss = bond_loss.unflatten(0, (batch_size, num_atoms, num_atoms))
 
         adj_matrix = smolF.adj_from_node_mask(mask, self_connect=True)
@@ -853,13 +1153,34 @@ class MolecularCFM(L.LightningModule):
         mask = data["mask"]
         batch_size, num_atoms, _ = pred_logits.size()
 
-        charges = torch.argmax(charges, dim=-1).flatten(0, 1)
+        charges = self._ce_target(charges, flatten_end=1)
         charge_loss = F.cross_entropy(pred_logits.flatten(0, 1), charges, reduction="none")
         charge_loss = charge_loss.unflatten(0, (batch_size, num_atoms))
 
         n_atoms = mask.sum(dim=1) + eps
         charge_loss = (charge_loss * mask).sum(dim=1) / n_atoms
         return charge_loss
+
+    def _ce_target(self, dist, flatten_end):
+        """Flatten a one-hot/soft target into whatever F.cross_entropy should receive.
+
+        Under a soft target the label is a distribution over classes, not a class index. Passing it
+        straight through is not a relaxation of the loss -- cross-entropy is the Bregman divergence
+        generated by Phi(u) = u log u - u, so the target enters linearly and a posterior-mean label
+        is exactly the right thing to regress on.
+
+        Note the reported value is not comparable across arms: CE against a soft label q is
+        H(q) + KL(q||p), and the H(q) term is a target-only constant that inflates the number
+        without touching gradients. It is logged as train-target-label-entropy so it can be
+        subtracted.
+
+        The hard path keeps the original argmax so the pre-target-axis baseline is untouched.
+        """
+
+        if self.target == "hard":
+            return torch.argmax(dist, dim=-1).flatten(0, flatten_end)
+
+        return dist.flatten(0, flatten_end).float()
 
     def _generate(self, prior, steps, strategy="linear", record_trajectory=False):
         if self.distill:
