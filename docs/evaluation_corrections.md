@@ -91,7 +91,7 @@ Core factorial:
 | **No coupling** | floor | isolates target effect | isolates target effect |
 | **Hungarian coupling** | Klein et al. baseline | **proposed** | **proposed** |
 
-Plus the contraction control from §2. Three seeds throughout.
+Three seeds throughout.
 
 Expected interaction, worth stating as a prediction: the soft target is a *local* average over
 permutations near the one that built x_t. A good coupling puts that neighbourhood in a sensible
@@ -120,9 +120,8 @@ RDKit helpers as the aggregate metrics.
    vs NFE with a zero line, so "the gap widens" is the literal shape of the curve; (c) "NFE
    required to reach threshold τ" as a single interpretable number.
 2. **GFN2-xTB pipeline** — see §4.1.
-3. **The contraction control run** — see §2.
-4. **Ryser estimator-bias comparison at n ≤ 12** — exact permanent marginals vs Sinkhorn vs MCMC on
+3. **Ryser estimator-bias comparison at n ≤ 12** — exact permanent marginals vs Sinkhorn vs MCMC on
    real cost matrices from the training loop. Cheap (CPU-seconds), disproportionate credibility:
    it quantifies the mean-field bias the argument rests on instead of asserting it.
-5. **Target-variance diagnostic** — see §4.6.
-6. **GEOM-Drugs** — everything so far is QM9.
+4. **Target-variance diagnostic** — see §4.6.
+5. **GEOM-Drugs** — everything so far is QM9.
