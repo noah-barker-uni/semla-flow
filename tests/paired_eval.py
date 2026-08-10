@@ -1,8 +1,10 @@
 import unittest
+from unittest import mock
 
 import numpy as np
+import pandas as pd
 import torch
-from rdkit import Chem
+from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem
 
 import semlaflow.util.metrics as metrics
@@ -78,24 +80,63 @@ class PairedEvalTests(unittest.TestCase):
         for value in valid_values:
             self.assertGreaterEqual(value, 0.0)
 
-    def test_per_molecule_posebusters_matches_raw_bust_aggregate(self):
-        from posebusters import PoseBusters
+    def test_per_molecule_posebusters_passes_clean_molecules(self):
+        # Ethanol, water and methane are chemically unimpeachable and must all pass. They did not
+        # before energy_ratio was excluded: that module scored water and methane as failures and
+        # returned NaN for strained cages, so it measured RDKit's conformer-embedding success rather
+        # than the molecule's plausibility.
+        per_mol = paired_eval.per_molecule_posebusters(self.mols)
+        self.assertEqual([True, True, True], per_mol)
 
-        mols_with_none = [self.mols[0], None, self.mols[1]]
+    def test_posebusters_config_excludes_energy_ratio(self):
+        functions = [module.get("function") for module in paired_eval._posebusters_config()["modules"]]
+        self.assertNotIn("energy_ratio", functions)
+        # The remaining plausibility checks must survive the filtering
+        for expected in ["rdkit_sanity", "atoms_connected", "distance_geometry", "flatness"]:
+            self.assertIn(expected, functions)
 
-        per_mol = paired_eval.per_molecule_posebusters(mols_with_none)
+    def test_per_molecule_posebusters_config_is_not_mutated_between_calls(self):
+        before = len(paired_eval._posebusters_config()["modules"])
+        paired_eval.per_molecule_posebusters(self.mols)
+        self.assertEqual(before, len(paired_eval._posebusters_config()["modules"]))
 
+    def test_per_molecule_posebusters_treats_unevaluated_check_as_skip_not_failure(self):
+        report = pd.DataFrame({"check_a": [True, True], "check_b": [np.nan, False]})
+        with mock.patch.object(paired_eval.PoseBusters, "bust", return_value=report):
+            per_mol = paired_eval.per_molecule_posebusters(self.mols[:2])
+
+        # First molecule passed everything that could be evaluated -> pass, despite the NaN
+        self.assertTrue(per_mol[0])
+        # Second genuinely failed a check -> fail
+        self.assertFalse(per_mol[1])
+
+    def test_per_molecule_posebusters_returns_none_when_nothing_evaluated(self):
+        report = pd.DataFrame({"check_a": [np.nan], "check_b": [np.nan]})
+        with mock.patch.object(paired_eval.PoseBusters, "bust", return_value=report):
+            per_mol = paired_eval.per_molecule_posebusters(self.mols[:1])
+
+        self.assertIsNone(per_mol[0])
+
+    def test_per_molecule_posebusters_preserves_position_of_none(self):
+        per_mol = paired_eval.per_molecule_posebusters([self.mols[0], None, self.mols[1]])
         self.assertEqual(3, len(per_mol))
         self.assertIsNone(per_mol[1])
-
-        report = PoseBusters(config="mol").bust([self.mols[0], self.mols[1]], None, None)
-        expected = report.fillna(False).all(axis=1).tolist()
-        self.assertEqual(expected[0], per_mol[0])
-        self.assertEqual(expected[1], per_mol[2])
+        self.assertTrue(per_mol[0])
+        self.assertTrue(per_mol[2])
 
     def test_per_molecule_posebusters_all_none_input(self):
         per_mol = paired_eval.per_molecule_posebusters([None, None])
         self.assertEqual([None, None], per_mol)
+
+    def test_per_molecule_posebusters_restores_rdkit_log_suppression(self):
+        # posebusters.modules.sanity re-enables RDKit's logger globally as a side effect, which
+        # otherwise floods the rest of a job's log with RDKit warnings.
+        RDLogger.DisableLog("rdApp.*")
+        paired_eval.per_molecule_posebusters(self.mols)
+
+        with mock.patch.object(paired_eval.RDLogger, "DisableLog") as disable_log:
+            paired_eval.per_molecule_posebusters(self.mols)
+        disable_log.assert_called_with("rdApp.*")
 
     def test_per_molecule_stability_matches_calc_atom_stabilities(self):
         mols_with_none = [self.mols[0], None, self.mols[2]]

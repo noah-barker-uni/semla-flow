@@ -12,21 +12,56 @@ computed, eg. an invalid molecule) -- callers rely on this positional alignment 
 molecules across independently-generated arms by slot index.
 """
 
+from copy import deepcopy
+from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
+import posebusters
 import torch
 from posebusters import PoseBusters
-from rdkit import Chem
+from rdkit import Chem, RDLogger
+from yaml import safe_load
 
 import semlaflow.util.rdkit as smolRD
 from semlaflow.util.metrics import calc_atom_stabilities
 
 # "mol" config: standalone-molecule physical-plausibility checks (bond lengths/angles, ring/double-
-# bond flatness, internal clash, internal energy, sanitization, InChI-convertibility, connectivity,
-# no radicals) that need no reference structure or protein pocket. The "gen"/"dock" configs add
-# protein-ligand distance and volume-overlap checks that don't apply to unconditional de novo
-# generation -- there is no pocket here.
+# bond flatness, internal clash, sanitization, InChI-convertibility, connectivity, no radicals) that
+# need no reference structure or protein pocket. The "gen"/"dock" configs add protein-ligand distance
+# and volume-overlap checks that don't apply to unconditional de novo generation -- there is no
+# pocket here.
 _POSEBUSTERS_CONFIG = "mol"
+
+# The energy_ratio module is dropped from that config. It scores a conformer's UFF energy against an
+# ETKDG-generated reference ensemble, and asserts *all* n conformers embed (energy_ratio.py:158,
+# `assert len(cids_etkdg) == n_confs`); any shortfall raises, and the module returns NaN. Generated
+# QM9-scale molecules are frequently strained fused cages that ETKDG cannot embed at all, so this
+# fires on ~8% of them -- meaning the check reports "could not be evaluated", not "implausible".
+# Keeping it would (a) judge those molecules on a different number of checks than the rest and
+# (b) make the metric partly a measure of ETKDG's embedding success rather than of molecule quality.
+# Its signal is also already covered, and covered better, by the MMFF energy/strain metrics computed
+# alongside it. Removing it additionally drops the dominant cost: the module embeds 50 conformers per
+# molecule and posebusters' own mol.yml lists it twice, so it ran 100 embeddings per molecule.
+_POSEBUSTERS_EXCLUDED_FUNCTIONS = frozenset({"energy_ratio"})
+
+
+@lru_cache(maxsize=1)
+def _posebusters_config() -> dict:
+    """PoseBusters' own `mol` config with the excluded modules stripped.
+
+    Read from the installed package rather than vendored here, so the checks stay in step with
+    whatever posebusters version is installed instead of silently drifting from it.
+    """
+
+    config_path = Path(posebusters.__file__).parent / "config" / f"{_POSEBUSTERS_CONFIG}.yml"
+    with open(config_path, encoding="utf-8") as config_file:
+        config = safe_load(config_file)
+
+    config["modules"] = [
+        module for module in config["modules"] if module.get("function") not in _POSEBUSTERS_EXCLUDED_FUNCTIONS
+    ]
+    return config
 
 
 def per_molecule_validity(mols: list[Chem.rdchem.Mol], connected: bool = False) -> list[bool]:
@@ -34,24 +69,37 @@ def per_molecule_validity(mols: list[Chem.rdchem.Mol], connected: bool = False) 
 
 
 def per_molecule_posebusters(mols: list[Chem.rdchem.Mol]) -> list[Optional[bool]]:
-    """PoseBusters "mol"-config pass/fail, one aggregate bool per molecule (all checks passed).
+    """PoseBusters physical-plausibility pass/fail (all checks passed), one bool per molecule.
 
-    A module that errors on a given molecule (eg. energy_ratio when there's no conformer) reports
-    NaN in PoseBusters' output, not a dropped row -- treated as a fail here (fillna(False)), not
-    skipped, since a check that couldn't run is not evidence the molecule is fine.
+    Returns None for a molecule that is itself None, or whose every check failed to evaluate.
+
+    A module that errors on a molecule reports NaN rather than dropping the row. Such a NaN means
+    "not evaluated", not "failed", so it is skipped rather than counted as a failure -- counting it
+    as a failure would make the metric partly a measure of RDKit's ability to process the molecule.
+    The one module where that happened at scale is excluded outright (see
+    _POSEBUSTERS_EXCLUDED_FUNCTIONS); this is the safety net for the rest.
     """
 
     valid_indices = [i for i, mol in enumerate(mols) if mol is not None]
     if not valid_indices:
         return [None] * len(mols)
 
-    buster = PoseBusters(config=_POSEBUSTERS_CONFIG)
+    buster = PoseBusters(config=deepcopy(_posebusters_config()))
     report = buster.bust([mols[i] for i in valid_indices], None, None)
-    passed = report.fillna(False).all(axis=1).tolist()
+
+    # posebusters.modules.sanity re-enables RDKit's logger globally after its own check
+    # (sanity.py:22-24), undoing scriptutil.disable_lib_stdout and flooding job logs with RDKit
+    # warnings for the rest of the run. Restore the suppression the caller asked for.
+    RDLogger.DisableLog("rdApp.*")
+
+    # skipna=True (the default) is what turns an unevaluated NaN check into a skip rather than a
+    # failure; a row that is entirely NaN yields True from all(), so guard that case explicitly.
+    passed = report.all(axis=1).tolist()
+    all_unevaluated = report.isna().all(axis=1).tolist()
 
     results: list[Optional[bool]] = [None] * len(mols)
-    for idx, mol_passed in zip(valid_indices, passed):
-        results[idx] = bool(mol_passed)
+    for idx, mol_passed, unevaluated in zip(valid_indices, passed, all_unevaluated):
+        results[idx] = None if unevaluated else bool(mol_passed)
 
     return results
 
