@@ -170,6 +170,56 @@ class SmolDM(L.LightningDataModule):
         raise NotImplementedError()
 
 
+def geometric_batch_to_dict(smol_batch, n_atoms):
+    """Collate a GeometricMolBatch into the padded tensor dict the model consumes.
+
+    Module level rather than a method so offline analyses (eg. semlaflow/target_variance.py) build
+    batches through exactly the same code path training does, instead of a copy that can drift.
+
+    Args:
+        smol_batch (GeometricMolBatch): Molecules to collate.
+        n_atoms (int): Padded atom count; must be >= the largest molecule in the batch.
+
+    Returns:
+        dict: coords [B,N,3] float, atomics [B,N,V] float one-hot, bonds [B,N,N,E] float one-hot,
+            charges [B,N,7] long one-hot, mask [B,N] long.
+    """
+
+    batch = [_fake_geometric_mol_like(smol_batch[0], n_atoms)] + smol_batch.to_list()
+    batch = GeometricMolBatch.from_list(batch)
+
+    coords = batch.coords.float()[1:]
+    atomics = batch.atomics.float()[1:]
+    bonds = batch.adjacency.float()[1:]
+    charges = batch.charges.long()[1:]
+    mask = batch.mask.long()[1:]
+
+    # Assume that charges have already been transformed to indices
+    if charges is not None:
+        n_charges = len(smolRD.CHARGE_IDX_MAP.keys())
+        charges = smolF.one_hot_encode_tensor(charges, n_charges)
+
+    return {"coords": coords, "atomics": atomics, "bonds": bonds, "charges": charges, "mask": mask}
+
+
+def _fake_geometric_mol_like(mol, n_atoms):
+    """An all-zero molecule of n_atoms, prepended purely to force pad_sequence up to that size."""
+
+    coords = torch.zeros((n_atoms, 3))
+    if len(mol.atomics.shape) == 1:
+        atomics = torch.zeros((n_atoms,))
+    else:
+        atomics = torch.zeros((n_atoms, mol.atomics.size(1)))
+
+    bond_indices = torch.tensor([[0, 0]])
+    if len(mol.bond_types.shape) == 1:
+        bond_types = torch.tensor([0])
+    else:
+        bond_types = torch.zeros((1, mol.bond_types.size(1)))
+
+    return GeometricMol(coords, atomics, bond_indices=bond_indices, bond_types=bond_types)
+
+
 # TODO could make this more general for all types of SmolMol
 # Just have to allow for different types of SmolMol in collate and take different tensors in batch_to_dict
 class GeometricDM(SmolDM):
@@ -209,22 +259,7 @@ class GeometricDM(SmolDM):
         # Pad batch to n_atoms using a fake mol
         # If we are not padding to bucket size get_padded_size will just return largest mol size
         n_atoms = self._get_padded_size(smol_batch)
-        batch = [self._fake_mol_like(smol_batch[0], n_atoms)] + smol_batch.to_list()
-        batch = GeometricMolBatch.from_list(batch)
-
-        coords = batch.coords.float()[1:]
-        atomics = batch.atomics.float()[1:]
-        bonds = batch.adjacency.float()[1:]
-        charges = batch.charges.long()[1:]
-        mask = batch.mask.long()[1:]
-
-        # Assume that charges have already been transformed to indices
-        if charges is not None:
-            n_charges = len(smolRD.CHARGE_IDX_MAP.keys())
-            charges = smolF.one_hot_encode_tensor(charges, n_charges)
-
-        data = {"coords": coords, "atomics": atomics, "bonds": bonds, "charges": charges, "mask": mask}
-        return data
+        return geometric_batch_to_dict(smol_batch, n_atoms)
 
     def _get_padded_size(self, smol_batch):
         largest_mol_size = max(smol_batch.seq_length)
@@ -237,22 +272,6 @@ class GeometricDM(SmolDM):
                 return size
 
         raise ValueError(f"Mol size of {largest_mol_size} is larger than largest padded size.")
-
-    def _fake_mol_like(self, mol, n_atoms):
-        coords = torch.zeros((n_atoms, 3))
-        if len(mol.atomics.shape) == 1:
-            atomics = torch.zeros((n_atoms,))
-        else:
-            atomics = torch.zeros((n_atoms, mol.atomics.size(1)))
-
-        bond_indices = torch.tensor([[0, 0]])
-        if len(mol.bond_types.shape) == 1:
-            bond_types = torch.tensor([0])
-        else:
-            bond_types = torch.zeros((1, mol.bond_types.size(1)))
-
-        return GeometricMol(coords, atomics, bond_indices=bond_indices, bond_types=bond_types)
-
 
 class GeometricInterpolantDM(GeometricDM):
     def __init__(

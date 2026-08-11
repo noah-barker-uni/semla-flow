@@ -144,6 +144,35 @@ class GeometricNoiseSampler(NoiseSampler):
             raise ValueError(f"{name}_mask_index must be provided if {name}_noise is 'mask'.")
 
 
+def coupling_transport_cost(from_mols: list[GeometricMol], to_mols: list[GeometricMol]) -> float:
+    """Mean per-atom squared displacement of the coupling, E||x1 - x0^pi||^2.
+
+    The companion metric that trajectory-straightness needs. Straightness (path length / chord) is
+    gameable: contracting the prior towards its mean makes every path more radial and so scores
+    better while making the model worse. Transport cost cannot be gamed that way -- it is a
+    property of the PAIRING alone, computed before any model exists, so together the two separate
+    "the coupling changed" from "the learned paths straightened".
+
+    Hungarian minimises this by construction, so it is also the direct check that a coupling is
+    doing what it claims.
+
+    Args:
+        from_mols (list[GeometricMol]): Coupled prior molecules x0^pi.
+        to_mols (list[GeometricMol]): Data molecules x1, index-aligned with from_mols.
+
+    Returns:
+        float: Mean over molecules of the per-atom mean squared displacement.
+    """
+
+    costs = []
+    for from_mol, to_mol in zip(from_mols, to_mols):
+        n = min(from_mol.seq_length, to_mol.seq_length)
+        diff = to_mol.coords[:n] - from_mol.coords[:n]
+        costs.append((diff * diff).sum(dim=-1).mean().item())
+
+    return float(sum(costs) / len(costs)) if costs else float("nan")
+
+
 class GeometricInterpolant(Interpolant):
     def __init__(
         self,

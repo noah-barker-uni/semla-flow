@@ -6,66 +6,34 @@ from rdkit import Chem
 from torchmetrics import Metric
 
 import semlaflow.util.rdkit as smolRD
-
-ALLOWED_VALENCIES = {
-    "H": {0: 1, 1: 0, -1: 0},
-    # Neutral C/N previously also allowed valence 3/2 respectively -- an aromatic-bond-rounding
-    # bug documented in Nikitin et al. "GEOM-Drugs Revisited" (arXiv 2505.00169), which named
-    # this codebase as one of several affected. RDKit's GetExplicitValence() already resolves
-    # aromaticity correctly, so neutral C/N should only ever be valence 4/3.
-    "C": {0: 4, 1: 3, -1: 3},
-    "N": {0: 3, 1: [2, 3, 4], -1: 2},  # In QM9, N+ seems to be present in the form NH+ and NH2+
-    "O": {0: 2, 1: 3, -1: 1},
-    "F": {0: 1, -1: 0},
-    "B": 3,
-    "Al": 3,
-    "Si": 4,
-    "P": {0: [3, 5], 1: 4},
-    "S": {0: [2, 6], 1: [2, 3], 2: 4, 3: 5, -1: 3},
-    "Cl": 1,
-    "As": 3,
-    "Br": {0: 1, 1: 2},
-    "I": 1,
-    "Hg": [1, 2],
-    "Bi": [3, 5],
-    "Se": [2, 4, 6],
-}
+import semlaflow.util.valency as smolValency
 
 
 def calc_atom_stabilities(mol):
+    """Per-atom stability using the aromatic-aware reference valency table.
+
+    Aromatic bonds are counted rather than assigned an order, so the 1-vs-1.5 rounding that
+    Nikitin et al. flag never happens -- see semlaflow/util/valency.py.
+    """
+
+    table = smolValency.load_valency_table()
     stabilities = []
 
     for atom in mol.GetAtoms():
-        atom_type = atom.GetSymbol()
-        valence = atom.GetExplicitValence()
-        charge = atom.GetFormalCharge()
+        bond_orders = [bond.GetBondTypeAsDouble() for bond in atom.GetBonds()]
+        n_aromatic, non_aromatic = smolValency.split_bond_orders(bond_orders)
 
-        if atom_type not in ALLOWED_VALENCIES:
-            stabilities.append(False)
-            continue
+        # Implicit/explicit hydrogens carry no Bond object, so they are absent from the loop above
+        # and have to be added back as single bonds
+        non_aromatic += atom.GetTotalNumHs()
 
-        allowed = ALLOWED_VALENCIES[atom_type]
-        atom_stable = _is_valid_valence(valence, allowed, charge)
-        stabilities.append(atom_stable)
+        stabilities.append(
+            smolValency.is_stable_atom(
+                atom.GetSymbol(), atom.GetFormalCharge(), n_aromatic, non_aromatic, table=table
+            )
+        )
 
     return stabilities
-
-
-def _is_valid_valence(valence, allowed, charge):
-    if isinstance(allowed, int):
-        valid = allowed == valence
-
-    elif isinstance(allowed, list):
-        valid = valence in allowed
-
-    elif isinstance(allowed, dict):
-        allowed = allowed.get(charge)
-        if allowed is None:
-            return False
-
-        valid = _is_valid_valence(valence, allowed, charge)
-
-    return valid
 
 
 def _is_valid_float(num):

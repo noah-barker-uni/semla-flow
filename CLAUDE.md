@@ -347,22 +347,29 @@ Next, in priority order:
        the knn proposal. **Still owed: a GPU step-time profile on Isambard before any real run.**
        On CPU at B=64/N=25 the target costs ~13 ms (sinkhorn, 100 it) vs ~9 ms (mcmc, 100 it), but
        MCMC is kernel-launch-bound so the ordering may invert on GPU.
-3. [ ] **NFE sweep** {1,2,5,10,20,50,100}. Highest-value missing experiment: the mechanism
-       predicts the gap *widens* at low NFE and nothing tests that. Everything so far ran at a
-       fixed 100 steps; `--integration_steps` already exists on both scripts, so this is a sweep
-       harness, not new metric code. Present as (a) metric vs NFE per arm; (b) the *difference*
-       vs NFE with a zero line, so "the gap widens" is the literal shape of the curve; (c) "NFE
-       required to reach threshold tau" as a single interpretable number.
+3. [done] **NFE sweep harness** — `python -m semlaflow.nfe_sweep`, {1,2,5,10,20,50,100}.
+       Prints (a) metric vs NFE per arm, (b) the *difference* vs NFE against a zero line so "the
+       gap widens" is the literal shape of the curve, (c) "NFE to reach threshold tau" as one
+       number. **Still owed: run it** — this is the highest-value missing *experiment*, since the
+       mechanism predicts the gap widens at low NFE and everything so far ran at a fixed 100.
 4. [done] **GFN2-xTB pipeline** — `semlaflow/util/xtb.py` + `python -m semlaflow.xtb_eval`,
        reading the SDF that `predict.py` already writes. Protocol matches
        `isayevlab/geom-drugs-3dgen-evaluation` (`xtb <xyz> --opt --charge q --gfn 2`, dE_relax
        read from the "total energy gain" line and negated) so numbers are comparable to their
        table. **Still owed: run it on Isambard** — see the install note below.
-5. [ ] **Ryser estimator-bias comparison at n <= 12** — exact permanent marginals vs Sinkhorn vs
-       MCMC on real cost matrices from the training loop. Cheap (CPU-seconds), disproportionate
-       credibility: quantifies the mean-field bias the argument rests on instead of asserting it.
-6. [ ] **Target-variance diagnostic** (see Key plots).
-7. [ ] **GEOM-Drugs** — everything so far is QM9.
+5. [done] **Ryser estimator-bias comparison at n <= 12** — `python -m semlaflow.estimator_bias`.
+       Exact permanent marginals (`semlaflow/util/permanent.py`) vs Sinkhorn vs MCMC on cost
+       matrices built the way the loss builds them. On synthetic molecules the mean-field claim
+       already holds at every t (sinkhorn entropy > exact, eg. 0.496 vs 0.319 at t=0.5) and the
+       hard argmin is far the crudest estimate at low t (dev 0.187 vs sinkhorn 0.003 at t=0.1).
+       **Re-run on real QM9 cost matrices before citing.**
+6. [done] **Target-variance diagnostic** — `python -m semlaflow.target_variance`. Note the
+       quantity the corrections doc names is degenerate here: under `--target hard` the target is
+       x1 regardless of x0, so its variance is exactly 0. The comparable quantity, and the one the
+       gradient actually sees, is the variance of `target - x_t`; both are printed.
+7. [ ] **GEOM-Drugs** — everything so far is QM9. Nothing to build: `--dataset geom-drugs` already
+       works throughout. The valency table is GEOM-Drugs-derived, so stability numbers become
+       exactly comparable to Nikitin et al. once this runs.
 
 ## Experimental design
 
@@ -400,10 +407,13 @@ soft-vs-hard gap. Which wins is the empirical question and is why the factorial 
    **gameable by contraction**, so always pair it with **coupling transport cost**
    `E||x1 - x0^pi||^2` — a training-time property of the pairing involving no model at all.
    Together they distinguish "the coupling changed" from "the learned paths straightened".
+   Built: `interpolate.py:coupling_transport_cost`, logged every step as `train-transport-cost`,
+   and reported per arm by `compare_arms.py` (which rebuilds the interpolant from the
+   checkpoint's own recorded training hparams, so no model is loaded).
 5. Target-variance diagnostic. NOT permutation flip rate — flip rate only applies to
-   hard-permutation arms, and under a soft target there is no pi to flip. The version that works
-   across every arm: fix x1 and t, resample x0 many times, measure the **variance of the resulting
-   regression target**. Directly measures the gradient noise the method claims to reduce.
+   hard-permutation arms, and under a soft target there is no pi to flip. Built as
+   `semlaflow/target_variance.py`; see the plan note above for why it reports the variance of
+   `target - x_t` alongside the variance of the target itself.
 6. Performance stratified by molecule size — gap should grow with n
 7. Wall-clock per step — Sinkhorn O(n^2) batched should beat Hungarian O(n^3) sequential
 8. Entropy of P vs t — shows how much blending is actually happening
@@ -429,14 +439,18 @@ torsion differences between each generated molecule and *its own* GFN2-xTB-optim
 More interpretable than distribution-level Wasserstein and the field's emerging standard. Keep the
 Wasserstein distances against reference distributions as secondary.
 
-**Valency table:** the hand-patch to `"C": {0: 4}`, `"N": {0: 3}` in `metrics.py` is the right
-direction but a partial approximation — neither 1 nor 1.5 is a universally correct aromatic bond
-order. Use the reference implementation from `github.com/isayevlab/geom-drugs-3dgen-evaluation`
-(table indexed by `(element, n_aromatic_bonds, formal_charge, valency)` giving the allowed
-*non-aromatic* bond order), or retrain on a kekulised dataset. Worth doing properly: this codebase
-is named in that paper as affected.
+**Valency table: [done]** `semlaflow/util/valency.py` + the vendored reference table in
+`semlaflow/util/valency_tables/`. Aromatic bonds are *counted* and non-aromatic orders summed
+separately, keyed `(element, charge) -> {(n_aromatic, non_aromatic_valence)}`, so no aromatic bond
+order is ever assigned and the 1-vs-1.5 question does not arise. This fixed a real bug: the
+training-time path in `fm.py` summed bond orders and truncated, so a **pyrrole-type N-H
+(1.5+1.5+1 = 4.0 -> 4, vs neutral N allowing only 3) was scored unstable** — that is indole,
+imidazole and pyrazole, so any previously reported `val-molecule-stability` was penalised for them.
+Caveat: the table is GEOM-Drugs-derived and QM9's NH+/NH2+ are not in it; the removed hand-patch
+allowed them. `load_valency_table(allow_legacy_qm9=True)` restores them explicitly, but numbers
+computed that way are no longer the reference protocol's.
 
-**PoseBusters:** keep but secondary. It is already built and the `energy_ratio` trap is already
+**PoseBusters:** keep but secondary (marked as such in `paired_eval.py`). It is already built and the `energy_ratio` trap is already
 debugged, so it costs nothing, but it is not a replacement for RDKit validity (different question:
 3D geometric plausibility vs 2D graph chemistry) and the GFN2-xTB geometry deviations are strictly
 more sensitive.
@@ -444,6 +458,8 @@ more sensitive.
 Scale: 5000 molecules for the headline table, ~1000 per point for the NFE sweep.
 
 ### Statistics
+
+Built as `semlaflow/util/stats.py`; `compare_arms.py` uses it and no longer imports `wilcoxon`.
 
 **Do not use Wilcoxon signed-rank.** `compare_arms.py` matches arms on the **size sequence** drawn
 from the test set. That is a legitimate blocking variable and worth keeping, but it is *not* true

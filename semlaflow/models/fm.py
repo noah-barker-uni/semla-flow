@@ -12,6 +12,7 @@ from torchmetrics import MetricCollection
 import semlaflow.util.functional as smolF
 import semlaflow.util.metrics as Metrics
 import semlaflow.util.rdkit as smolRD
+import semlaflow.util.valency as smolValency
 from semlaflow.models.semla import MolecularGenerator
 from semlaflow.util.molrepr import GeometricMol
 from semlaflow.util.tokeniser import Vocabulary
@@ -562,22 +563,25 @@ class MolBuilder:
         bond_types = torch.tensor(bonds[:, 2])
         adj = smolF.adj_from_edges(bond_indices, bond_types, n_atoms, symmetric=True)
 
-        adj[adj == 4] = 1.5
-        valencies = adj.sum(dim=-1).long()
+        adj[adj == 4] = smolValency.AROMATIC_BOND_ORDER
 
+        # Count aromatic bonds and sum the rest separately, rather than summing everything and
+        # truncating -- that truncation is the aromatic-rounding bug. See semlaflow/util/valency.py.
+        n_aromatic = (adj == smolValency.AROMATIC_BOND_ORDER).sum(dim=-1)
+        non_aromatic = (adj * (adj != smolValency.AROMATIC_BOND_ORDER)).sum(dim=-1)
+
+        table = smolValency.load_valency_table()
         stabilities = []
         for i in range(n_atoms):
-            atom_type = atomics[i]
-            charge = charges[i]
-            valence = valencies[i].item()
-
-            if atom_type not in Metrics.ALLOWED_VALENCIES:
-                stabilities.append(False)
-                continue
-
-            allowed = Metrics.ALLOWED_VALENCIES[atom_type]
-            atom_stable = Metrics._is_valid_valence(valence, allowed, charge)
-            stabilities.append(atom_stable)
+            stabilities.append(
+                smolValency.is_stable_atom(
+                    atomics[i],
+                    charges[i],
+                    int(n_aromatic[i].item()),
+                    float(non_aromatic[i].item()),
+                    table=table,
+                )
+            )
 
         return stabilities
 
@@ -853,7 +857,7 @@ class MolecularCFM(L.LightningModule):
         return out
 
     def training_step(self, batch, b_idx):
-        _, data, interpolated, times = batch
+        prior, data, interpolated, times = batch
 
         if self.distill:
             return self._distill_training_step(batch)
@@ -902,8 +906,25 @@ class MolecularCFM(L.LightningModule):
             self.log(f"train-{name}", loss_val, on_step=True, logger=True)
 
         self.log("train-loss", loss, prog_bar=True, on_step=True, logger=True)
+        self.log("train-transport-cost", self._transport_cost(prior, data), on_step=True, logger=True)
 
         return loss
+
+    @torch.no_grad()
+    def _transport_cost(self, prior, data):
+        """E||x1 - x0^pi||^2, the coupling's own cost -- straightness's companion metric.
+
+        Trajectory straightness is gameable by contracting the prior: shrinking x0 towards its mean
+        makes every path more radial and so scores better while making the model worse. This cannot
+        be gamed that way, because no model enters it -- it is a property of the pairing alone,
+        fixed the moment the batch is collated. Reported together they separate "the coupling
+        changed" from "the learned paths straightened".
+        """
+
+        mask = data["mask"].unsqueeze(2)
+        diff = (data["coords"] - prior["coords"]) * mask
+        per_mol = diff.pow(2).sum(dim=2).sum(dim=1) / data["mask"].sum(dim=1).clamp_min(1)
+        return per_mol.mean()
 
     def on_train_batch_end(self, outputs, batch, b_idx):
         if self.ema_gen is not None:

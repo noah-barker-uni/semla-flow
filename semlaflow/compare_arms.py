@@ -1,14 +1,25 @@
 """
-Paired comparison between two trained checkpoints (eg. two coupling arms).
+Comparison between two trained checkpoints (eg. two arms of the coupling x target factorial).
 
 Unconditional generation has no natural pairing between "arm A's molecule i" and "arm B's
 molecule i" -- each is freely sampled from noise by an independently-trained model, not a
-reconstruction of a shared reference. The pairing used here is by test-set size-slot: both
-arms are run with the same --seed, --n_molecules and --dataset_split, so both draw the exact
-same sequence of real test-set molecule sizes to condition generation on (see
-GeometricDataset.sample, which uses np.random.choice -- covered by L.seed_everything). Slot i
-in both arms is therefore sized to match the same real molecule, which is what makes a paired
-Wilcoxon signed-rank test meaningful here.
+reconstruction of a shared reference. What IS shared is the size sequence: both arms run with the
+same --seed, --n_molecules and --dataset_split, so both draw the same sequence of real test-set
+molecule sizes to condition generation on (GeometricDataset.sample uses np.random.choice, covered
+by L.seed_everything). Slot i in each arm is therefore sized to match the same real molecule.
+
+That is blocking, NOT pairing, and the distinction decides which tests are legal. Arm A's molecule
+i and arm B's molecule i are different molecules that happen to have the same atom count, so
+Wilcoxon signed-rank -- which assumes genuinely paired observations -- does not apply and has been
+removed. Instead:
+
+  - the size-matched difference is reported as a variance-reduced DESCRIPTIVE;
+  - the formal claim uses UNPAIRED Mann-Whitney U plus a bootstrap CI on the difference of medians;
+  - every comparison carries an EFFECT SIZE (Cliff's delta), because p ~ 1e-195 at n=2000 reflects
+    a systematic difference of unknown size, not an important one.
+
+See semlaflow/util/stats.py. Across seeds, three points have almost no power for a formal test --
+report the three seed-level values per arm and let them speak.
 
 Note: size-stratified buckets below use each *generated* molecule's own atom count, not the
 target size that seeded it -- simpler for this first pass, though the intended-size would be
@@ -16,15 +27,18 @@ a more principled stratification variable if threaded through separately later.
 """
 
 import argparse
+from functools import partial
 from pathlib import Path
 
 import lightning as L
 import numpy as np
-from scipy.stats import wilcoxon
+import torch
 
 import semlaflow.scriptutil as util
 import semlaflow.util.geometry_metrics as geometry_metrics
+import semlaflow.util.stats as stats
 from semlaflow.data.datasets import GeometricDataset
+from semlaflow.data.interpolate import GeometricInterpolant, GeometricNoiseSampler, coupling_transport_cost
 from semlaflow.evaluate import dm_from_ckpt, load_model
 from semlaflow.util.paired_eval import (
     per_molecule_energy,
@@ -102,6 +116,50 @@ def _load_reference_mols(args, vocab):
     return [dataset[i].to_rdkit(vocab) for i in range(len(dataset))]
 
 
+def _transport_cost_for_arm(args, ckpt_path, vocab, n_batches=20, batch_size=64):
+    """Measure E||x1 - x0^pi||^2 for the coupling this checkpoint was TRAINED with.
+
+    Straightness's companion metric (see coupling_transport_cost). No model is loaded and no
+    generation happens -- the interpolant is rebuilt from the checkpoint's own recorded training
+    hparams and run over real molecules, so this is a property of the coupling config alone.
+    """
+
+    hparams = torch.load(ckpt_path, map_location="cpu")["hyper_parameters"]
+    coupling = hparams.get("train-coupling", hparams.get("coupling"))
+    kabsch = hparams.get("train-kabsch-align", hparams.get("kabsch_align", False))
+
+    if coupling is None:
+        return None, None
+
+    dataset_path = Path(args.data_path) / _SPLIT_FILES[args.dataset_split]
+    coord_std = util.QM9_COORDS_STD_DEV if args.dataset == "qm9" else util.GEOM_COORDS_STD_DEV
+    n_bond_types = util.get_n_bond_types(hparams.get("train-bond-interpolation", "unmask"))
+    transform = partial(util.mol_transform, vocab=vocab, n_bonds=n_bond_types, coord_std=coord_std)
+    dataset = GeometricDataset.load(dataset_path, transform=transform)
+
+    prior_sampler = GeometricNoiseSampler(
+        vocab.size,
+        n_bond_types,
+        coord_noise="gaussian",
+        type_noise="uniform-sample",
+        bond_noise="uniform-sample",
+        scale_ot=False,
+        zero_com=True,
+    )
+    interpolant = GeometricInterpolant(
+        prior_sampler, coupling=coupling, kabsch_align=bool(kabsch), fixed_time=0.5
+    )
+
+    L.seed_everything(args.seed)
+    costs = []
+    for start in range(0, min(n_batches * batch_size, len(dataset)), batch_size):
+        to_mols = [dataset[i] for i in range(start, min(start + batch_size, len(dataset)))]
+        from_mols, to_out, _, _ = interpolant.interpolate(to_mols)
+        costs.append(coupling_transport_cost(from_mols, to_out))
+
+    return (float(np.mean(costs)) if costs else None), f"{coupling}/kabsch={bool(kabsch)}"
+
+
 def _collect_per_molecule(molecules):
     atom_stable_frac, mol_stable = per_molecule_stability(molecules)
     return {
@@ -115,21 +173,8 @@ def _collect_per_molecule(molecules):
     }
 
 
-def _paired_diffs(values_a, values_b):
-    return [a - b for a, b in zip(values_a, values_b) if a is not None and b is not None]
-
-
-def _run_wilcoxon(values_a, values_b):
-    diffs = _paired_diffs(values_a, values_b)
-    if len(diffs) < 2 or not any(diffs):
-        return None, None, len(diffs)
-
-    try:
-        statistic, p_value = wilcoxon(diffs)
-    except ValueError:
-        return None, None, len(diffs)
-
-    return statistic, p_value, len(diffs)
+def _fmt(value, spec=".4f"):
+    return format(value, spec) if value is not None and np.isfinite(value) else "n/a"
 
 
 def _size_buckets(molecules, bucket_limits):
@@ -170,14 +215,50 @@ def compare(args, vocab):
     buckets_a = _size_buckets(molecules_a, bucket_limits)
 
     print()
-    print(f"{'Metric':<24}{'n_paired':<10}{'Wilcoxon stat':<16}{'p-value':<12}")
-    print("-" * 62)
+    print("Unpaired comparison (Mann-Whitney U). The arms are size-BLOCKED, not paired, so the")
+    print("formal test must be unpaired -- see semlaflow/util/stats.py.")
+    print()
+    cliffs = "Cliff's d"
+    header = (
+        f"{'Metric':<24}{'median A':>11}{'median B':>11}{'mean A':>11}{'mean B':>11}"
+        f"{'p':>11}{cliffs:>11}{'95% CI on median diff':>26}"
+    )
+    print(header)
+    print("-" * len(header))
 
+    results = {}
     for metric in per_mol_a:
-        stat, p_value, n_paired = _run_wilcoxon(per_mol_a[metric], per_mol_b[metric])
-        stat_str = f"{stat:.4f}" if stat is not None else "n/a"
-        p_str = f"{p_value:.4g}" if p_value is not None else "n/a"
-        print(f"{metric:<24}{n_paired:<10}{stat_str:<16}{p_str:<12}")
+        result = stats.compare_metric(per_mol_a[metric], per_mol_b[metric], seed=args.seed)
+        results[metric] = result
+
+        test, boot = result["test"], result["bootstrap"]
+        ci = (
+            f"[{boot['ci_low']:.4f}, {boot['ci_high']:.4f}]"
+            if boot["ci_low"] is not None
+            else "n/a"
+        )
+        print(
+            f"{metric:<24}"
+            f"{_fmt(result['a']['median']):>11}{_fmt(result['b']['median']):>11}"
+            f"{_fmt(result['a']['mean']):>11}{_fmt(result['b']['mean']):>11}"
+            f"{_fmt(test['p'], '.3g'):>11}{_fmt(test['cliffs_delta'], '.3f'):>11}"
+            f"{ci:>26}"
+        )
+
+    print()
+    print("Effect size guide: |d| < 0.147 negligible, < 0.33 small, < 0.474 medium, else large.")
+    print("A tiny p with a negligible d means a real but unimportant difference.")
+
+    print()
+    print("Size-matched difference (A - B), DESCRIPTIVE ONLY -- blocking reduces variance but does")
+    print("not license a paired test:")
+    print(f"{'Metric':<24}{'n slots':>10}{'mean diff':>14}{'median diff':>14}")
+    for metric in per_mol_a:
+        matched = stats.size_matched_difference(per_mol_a[metric], per_mol_b[metric])
+        print(
+            f"{metric:<24}{matched['n_slots']:>10}"
+            f"{_fmt(matched['mean_difference']):>14}{_fmt(matched['median_difference']):>14}"
+        )
 
     print()
     print("Size-stratified means (generated-molecule atom count, bucketed):")
@@ -190,6 +271,15 @@ def compare(args, vocab):
             val_a = f"{strat_a[limit]:.4f}" if strat_a[limit] is not None else "n/a"
             val_b = f"{strat_b[limit]:.4f}" if strat_b[limit] is not None else "n/a"
             print(f"  {limit:<10}{val_a:<18}{val_b:<18}")
+
+    print()
+    print("Coupling transport cost E||x1 - x0^pi||^2 -- straightness's companion. No model is")
+    print("involved, so a straightness gain WITHOUT a transport-cost change means the learned")
+    print("paths straightened; a gain WITH one means the coupling moved and straightness may")
+    print("simply be tracking that.")
+    for label, ckpt in [(args.label_a, args.ckpt_path_a), (args.label_b, args.ckpt_path_b)]:
+        cost, config = _transport_cost_for_arm(args, ckpt, vocab)
+        print(f"  {label:<18}{_fmt(cost):>12}   (trained with coupling={config})")
 
     print()
     print(f"Loading up to {args.n_reference_molecules} reference molecules from {args.dataset_split}.smol...")

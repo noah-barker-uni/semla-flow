@@ -71,6 +71,12 @@ def per_molecule_validity(mols: list[Chem.rdchem.Mol], connected: bool = False) 
 def per_molecule_posebusters(mols: list[Chem.rdchem.Mol]) -> list[Optional[bool]]:
     """PoseBusters physical-plausibility pass/fail (all checks passed), one bool per molecule.
 
+    SECONDARY METRIC. Kept because it is already built and the energy_ratio trap is already
+    debugged, so it costs nothing to keep reporting -- but it is not a replacement for RDKit
+    validity (that asks a different question: 3D geometric plausibility vs 2D graph chemistry),
+    and for judging geometry the GFN2-xTB deviations in semlaflow/xtb_eval.py are strictly more
+    sensitive. Report it alongside, not as the headline.
+
     Returns None for a molecule that is itself None, or whose every check failed to evaluate.
 
     A module that errors on a molecule reports NaN rather than dropping the row. Such a NaN means
