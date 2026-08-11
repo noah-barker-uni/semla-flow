@@ -19,16 +19,17 @@ from semlaflow.util.tokeniser import Vocabulary
 _T = torch.Tensor
 _BatchT = dict[str, _T]
 
-# "mcmc" -- an unbiased single sample from the same posterior -- is the planned third value and is
-# deliberately not listed until it is implemented, same discipline as COUPLING_TYPES.
-TARGET_TYPES = ["hard", "sinkhorn"]
+# "sinkhorn" is the mean-field deterministic average of the posterior over permutations; "mcmc" is
+# an unbiased single sample from the same posterior. Single-sample is legitimate because the loss
+# is linear in the target, so the expected gradient depends on the target only through its mean.
+TARGET_TYPES = ["hard", "sinkhorn", "mcmc"]
 
 # Number of t buckets the plan-entropy-vs-t curve is accumulated into over an epoch.
 TARGET_T_BINS = 10
 
 # Temperature below which the entropic plan is replaced by its exact zero-temperature limit.
 #
-# This is NOT the removed COUPLING_MIN_EPS clamp (see docs/Sinkhorn_corrections.md 3.4). That clamp
+# This is NOT the removed COUPLING_MIN_EPS clamp (see CLAUDE.md, defect 4). That clamp
 # floored eps and then kept blending at the floored value, so the intended t -> 1 sharpening
 # silently never happened. Here a floored eps exists only to keep sinkhorn_batched's eps > 0 check
 # legal, and the resulting plan is THROWN AWAY and replaced by the identity -- which is the exact
@@ -52,6 +53,9 @@ def permutation_target(
     target: str,
     noise_std: float = 0.0,
     sinkhorn_iters: int = 100,
+    mcmc_iters: int = 100,
+    mcmc_proposal: str = "knn",
+    mcmc_knn_k: int = 8,
     eps_override: Optional[_T] = None,
 ) -> tuple[_BatchT, dict[str, _T]]:
     """Build the regression target the model is trained against, given the current state x_t.
@@ -60,9 +64,17 @@ def permutation_target(
 
         w(pi') ~ exp( -||x_t - t * pi'(x1)||^2 / (2 * var) ),    var = Var(x_t | x1, t)
 
-    estimated by sinkhorn. This is legitimate precisely where soft-permuting the PRIOR was not: the
-    model is x1-parameterised, so the Bayes-optimal target is E[x1 | x_t], a posterior mean. See
+    estimated either by sinkhorn (the mean-field deterministic average) or by mcmc (an unbiased
+    single sample). This is legitimate precisely where soft-permuting the PRIOR was not: the model
+    is x1-parameterised, so the Bayes-optimal target is E[x1 | x_t], a posterior mean. See
     docs/Sinkhorn_corrections.md.
+
+    A single mcmc sample is enough because the loss is linear in the target, so its expected
+    gradient depends on the target only through its mean. Note the two estimators are not
+    interchangeable at low t: the chain starts at the identity and only explores a neighbourhood of
+    it, so the mcmc target stays closer to the hard one than the sinkhorn average does. Whether
+    that neighbourhood is big enough for the arm to mean anything is what the move-fraction
+    diagnostic is for.
 
     The temperature is not a free hyperparameter -- it is the conditional path's own variance. With
     x_t = (1-t) x0 + t x1 + noise_std * z, that is var = (1-t)^2 + noise_std^2, and since sinkhorn
@@ -83,13 +95,17 @@ def permutation_target(
         times (_T): Interpolation times, shape [B].
         target (str): One of TARGET_TYPES.
         noise_std (float): The interpolant's coord_noise_std, part of the conditional variance.
-        sinkhorn_iters (int): Solver iterations.
+        sinkhorn_iters (int): Solver iterations, target="sinkhorn" only.
+        mcmc_iters (int): Metropolis iterations, target="mcmc" only.
+        mcmc_proposal (str): "uniform" or "knn", target="mcmc" only.
+        mcmc_knn_k (int): Neighbours the knn proposal may swap with, target="mcmc" only.
         eps_override (Optional[_T]): Shape [B]. Bypasses the schedule entirely. Exists so tests can
             drive the temperature directly instead of inverting the schedule; not used in training.
 
     Returns:
         tuple[_BatchT, dict[str, _T]]: (target batch, per-batch diagnostics). For target="hard" the
             data object itself is returned unchanged, with no tensor ops and no RNG consumed.
+            target="mcmc" DOES consume global RNG, so its stream diverges from the other two arms.
     """
 
     if target not in TARGET_TYPES:
@@ -119,8 +135,35 @@ def permutation_target(
     scaled_data_coords = times.view(-1, 1, 1) * data["coords"]
     cost = smolF.inter_distances(interpolated["coords"], scaled_data_coords, sqrd=True)
 
-    raw_plan = smolF.sinkhorn_batched(cost, mask, eps.clamp_min(TARGET_MIN_EPS), n_iters=sinkhorn_iters)
-    plan, row_dev = smolF.plan_from_sinkhorn(raw_plan, mask)
+    eps_safe = eps.clamp_min(TARGET_MIN_EPS)
+
+    if target == "sinkhorn":
+        raw_plan = smolF.sinkhorn_batched(cost, mask, eps_safe, n_iters=sinkhorn_iters)
+        plan, row_dev = smolF.plan_from_sinkhorn(raw_plan, mask)
+
+    else:
+        # The coupling permuted the PRIOR, leaving x1 in its original index order, so x_t[i] was
+        # built from x1[i]: the identity IS the permutation that generated x_t. That makes it a
+        # draw from the posterior's own high-probability region -- the right place to start a short
+        # chain -- and it removes the per-molecule scipy call that a hungarian init would need,
+        # which in the loss would mean a GPU->CPU sync on the critical path.
+        init_perm = torch.arange(n, device=cost.device).unsqueeze(0).expand(batch_size, n).contiguous()
+
+        perm = smolF.mcmc_permutation(
+            cost,
+            mask,
+            eps_safe,
+            mcmc_iters,
+            init_perm=init_perm,
+            proposal=mcmc_proposal,
+            knn_k=mcmc_knn_k,
+            # The row index of cost is a slot of x_t, and a transposition of slots i, i' is only
+            # ever accepted when x_t[i] is near x_t[i'], so the knn graph lives in x_t space. Using
+            # x1 coords here would be nearly right as t -> 1 and badly wrong at small t.
+            to_coords=interpolated["coords"],
+        )
+        plan = smolF.permutation_to_plan(perm, mask, dtype=cost.dtype)
+        row_dev = None
 
     # Discard any plan computed at a clamped temperature in favour of its exact limit
     eye = torch.eye(n, dtype=plan.dtype, device=plan.device).expand(batch_size, n, n)
@@ -226,6 +269,12 @@ def _target_diagnostics(
     norm_entropy = (row_entropy * mask_f).sum(dim=1) / (n_real * n_real.clamp_min(2.0).log())
     eff_atoms = (mask_f / plan.pow(2).sum(dim=2).clamp_min(1e-12)).sum(dim=1) / n_real
     plan_diag = (plan.diagonal(dim1=1, dim2=2) * mask_f).sum(dim=1) / n_real
+
+    # For a sampled hard permutation the entropy diagnostics are all degenerate (entropy 0, one
+    # effective atom), so the only thing that says whether the chain went anywhere is how many
+    # slots moved off the identity it started from. If this sits near 0 the arm is a hard arm in
+    # disguise and has to be reported as one, not as a soft-target result.
+    diagnostics["target-move-frac"] = 1.0 - plan_diag.mean()
 
     coord_shift = ((target["coords"] - data["coords"]) * mask_f.unsqueeze(2)).pow(2).sum(dim=(1, 2))
     coord_norm = (data["coords"] * mask_f.unsqueeze(2)).pow(2).sum(dim=(1, 2)).clamp_min(1e-12)
@@ -615,6 +664,9 @@ class MolecularCFM(L.LightningModule):
         target: str = "hard",
         target_noise_std: float = 0.0,
         target_sinkhorn_iters: int = 100,
+        target_mcmc_iters: int = 100,
+        target_mcmc_proposal: str = "knn",
+        target_mcmc_knn_k: int = 8,
         **kwargs
     ):
         super().__init__()
@@ -668,6 +720,9 @@ class MolecularCFM(L.LightningModule):
         self.target = target
         self.target_noise_std = target_noise_std
         self.target_sinkhorn_iters = target_sinkhorn_iters
+        self.target_mcmc_iters = target_mcmc_iters
+        self.target_mcmc_proposal = target_mcmc_proposal
+        self.target_mcmc_knn_k = target_mcmc_knn_k
 
         # persistent=False is load-bearing: these must never enter state_dict, or a checkpoint
         # written by a soft arm stops loading in an arm that does not define them
@@ -705,6 +760,9 @@ class MolecularCFM(L.LightningModule):
             "target": target,
             "target_noise_std": target_noise_std,
             "target_sinkhorn_iters": target_sinkhorn_iters,
+            "target_mcmc_iters": target_mcmc_iters,
+            "target_mcmc_proposal": target_mcmc_proposal,
+            "target_mcmc_knn_k": target_mcmc_knn_k,
             **gen.hparams,
             **integrator.hparams,
             **kwargs
@@ -885,6 +943,9 @@ class MolecularCFM(L.LightningModule):
             self.target,
             noise_std=self.target_noise_std,
             sinkhorn_iters=self.target_sinkhorn_iters,
+            mcmc_iters=self.target_mcmc_iters,
+            mcmc_proposal=self.target_mcmc_proposal,
+            mcmc_knn_k=self.target_mcmc_knn_k,
         )
 
         entropy = diagnostics.pop("target-plan-entropy-per-sample", None)
@@ -1161,6 +1222,18 @@ class MolecularCFM(L.LightningModule):
         charge_loss = (charge_loss * mask).sum(dim=1) / n_atoms
         return charge_loss
 
+    @property
+    def _soft_labels(self):
+        """Only the sinkhorn target produces genuinely soft labels.
+
+        target="mcmc" is a single sampled permutation, so P @ onehot is still exactly one-hot and
+        argmax(P @ onehot) == perm(argmax(onehot)). Routing it through the class-index path is not
+        an approximation, just the cheaper way to compute the same number -- it gathers instead of
+        summing over the class axis, which matters for bonds at [B*N*N, E].
+        """
+
+        return self.target == "sinkhorn"
+
     def _ce_target(self, dist, flatten_end):
         """Flatten a one-hot/soft target into whatever F.cross_entropy should receive.
 
@@ -1169,7 +1242,7 @@ class MolecularCFM(L.LightningModule):
         generated by Phi(u) = u log u - u, so the target enters linearly and a posterior-mean label
         is exactly the right thing to regress on.
 
-        Note the reported value is not comparable across arms: CE against a soft label q is
+        Note the reported value is then not comparable across arms: CE against a soft label q is
         H(q) + KL(q||p), and the H(q) term is a target-only constant that inflates the number
         without touching gradients. It is logged as train-target-label-entropy so it can be
         subtracted.
@@ -1177,7 +1250,7 @@ class MolecularCFM(L.LightningModule):
         The hard path keeps the original argmax so the pre-target-axis baseline is untouched.
         """
 
-        if self.target == "hard":
+        if not self._soft_labels:
             return torch.argmax(dist, dim=-1).flatten(0, flatten_end)
 
         return dist.flatten(0, flatten_end).float()

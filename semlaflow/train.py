@@ -56,6 +56,9 @@ DEFAULT_COUPLING = "hungarian"
 DEFAULT_KABSCH_ALIGN = True
 DEFAULT_TARGET = "hard"
 DEFAULT_TARGET_SINKHORN_ITERS = 100
+DEFAULT_TARGET_MCMC_ITERS = 100
+DEFAULT_TARGET_MCMC_PROPOSAL = "knn"
+DEFAULT_TARGET_MCMC_KNN_K = 8
 
 
 def build_model(args, dm, vocab):
@@ -192,6 +195,9 @@ def build_model(args, dm, vocab):
         # interpolant's coord noise -- so the model must be told the sigma actually in use
         target_noise_std=args.coord_noise_std_dev,
         target_sinkhorn_iters=args.target_sinkhorn_iters,
+        target_mcmc_iters=args.target_mcmc_iters,
+        target_mcmc_proposal=args.target_mcmc_proposal,
+        target_mcmc_knn_k=args.target_mcmc_knn_k,
         **hparams,
     )
     return fm_model
@@ -456,6 +462,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--target", type=str, default=DEFAULT_TARGET, choices=TARGET_TYPES)
     parser.add_argument("--target_sinkhorn_iters", type=int, default=DEFAULT_TARGET_SINKHORN_ITERS)
+    parser.add_argument("--target_mcmc_iters", type=int, default=DEFAULT_TARGET_MCMC_ITERS)
+    parser.add_argument(
+        "--target_mcmc_proposal", type=str, default=DEFAULT_TARGET_MCMC_PROPOSAL, choices=["uniform", "knn"]
+    )
+    parser.add_argument("--target_mcmc_knn_k", type=int, default=DEFAULT_TARGET_MCMC_KNN_K)
 
     parser.set_defaults(
         trial_run=False,

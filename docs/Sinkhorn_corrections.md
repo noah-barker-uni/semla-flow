@@ -145,16 +145,5 @@ but it means the soft target resembles the hard one more when the coupling was a
 **Log the entropy of P as a function of t** so the amount of actual blending is visible rather than
 assumed.
 
-### 3.4 Investigate `COUPLING_MIN_EPS`
-
-At t=0.99 the measured ε reads 1e-3 where (1−0.99)² = 1e-4 — the clamp is binding, and
-`Σⱼ Pᵢⱼ² = 0.896` shows the plan is still mixing ~1.12 atoms where it should be essentially hard.
-The intended t→1 sharpening is not fully happening.
-
-The solver is already log-space (`functional.py:460`), which is exactly what removes the underflow
-motivating such a clamp. Determine whether the clamp is still needed; if it can be lowered or
-removed, the designed schedule actually takes effect. As it stands it is an undocumented
-hyperparameter doing real work, and reviewers will ask.
-
 ---
 

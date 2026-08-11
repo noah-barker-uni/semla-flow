@@ -239,6 +239,138 @@ class PermutationTargetTests(unittest.TestCase):
                     )
 
 
+class McmcTargetTests(unittest.TestCase):
+    def test_target_is_a_genuine_permutation_of_the_data(self):
+        """Unlike sinkhorn, the mcmc target must be a hard permutation -- one sample, not a mean.
+
+        So every channel must be a rearrangement of x1's, with the multisets preserved and the
+        discrete channels still exactly one-hot.
+        """
+
+        torch.manual_seed(0)
+        data, interpolated, times, _ = _fixture(sizes=(5, 3, 6), t=0.3, seed=20)
+
+        target, _ = permutation_target(data, interpolated, times, "mcmc", mcmc_iters=50)
+
+        mask = data["mask"]
+        for b in range(mask.size(0)):
+            n_b = int(mask[b].sum().item())
+
+            got = target["coords"][b, :n_b].sort(dim=0).values
+            want = data["coords"][b, :n_b].sort(dim=0).values
+            np.testing.assert_almost_equal(got.numpy(), want.numpy(), decimal=5)
+
+            for key in ["atomics", "charges"]:
+                rows = target[key][b, :n_b]
+                self.assertTrue(((rows == 0) | (rows == 1)).all().item(), f"{key} not one-hot")
+                self.assertTrue((rows.sum(dim=-1) == 1).all().item(), f"{key} rows not one-hot")
+                got = target[key][b, :n_b].sum(dim=0)
+                want = data[key][b, :n_b].to(got.dtype).sum(dim=0)
+                np.testing.assert_almost_equal(got.numpy(), want.numpy(), decimal=5)
+
+    def test_bonds_stay_one_hot_and_symmetric(self):
+        torch.manual_seed(1)
+        data, interpolated, times, _ = _fixture(t=0.3, seed=21)
+
+        target, _ = permutation_target(data, interpolated, times, "mcmc", mcmc_iters=50)
+
+        bonds = target["bonds"]
+        self.assertTrue(((bonds == 0) | (bonds == 1)).all().item())
+        np.testing.assert_almost_equal(bonds.numpy(), bonds.transpose(1, 2).numpy(), decimal=6)
+
+    def test_tiny_temperature_stays_at_the_identity(self):
+        """The chain starts at the identity, which is already optimal when x_t = t*x1.
+
+        Mirrors tests/functional.py's tiny-eps mcmc test, but through the target path: at a
+        temperature that accepts no uphill move, the target must be x1 untouched.
+        """
+
+        torch.manual_seed(2)
+        identity = torch.arange(6).unsqueeze(0).repeat(3, 1)
+        data, interpolated, times, _ = _fixture(t=0.9, seed=22, sigma=identity)
+        eps = torch.full((3,), 1e-4)
+
+        target, diag = permutation_target(
+            data, interpolated, times, "mcmc", mcmc_iters=100, eps_override=eps
+        )
+
+        self.assertTrue(torch.equal(target["coords"], data["coords"]))
+        self.assertAlmostEqual(diag["target-move-frac"].item(), 0.0, places=6)
+
+    def test_move_fraction_is_reported_and_grows_as_t_falls(self):
+        """The diagnostic that decides whether this arm means anything.
+
+        At low t the posterior is near-uniform so the chain should wander; at high t it should sit
+        still. If move-frac were ~0 everywhere the arm would be a hard arm in disguise.
+        """
+
+        fracs = []
+        for t in [0.05, 0.95]:
+            torch.manual_seed(3)
+            identity = torch.arange(6).unsqueeze(0).repeat(3, 1)
+            data, interpolated, times, _ = _fixture(t=t, seed=23, sigma=identity)
+            _, diag = permutation_target(
+                data, interpolated, times, "mcmc", noise_std=0.0, mcmc_iters=100
+            )
+            fracs.append(diag["target-move-frac"].item())
+
+        self.assertGreater(fracs[0], fracs[1])
+        self.assertGreater(fracs[0], 0.0)
+
+    def test_padding_rows_are_untouched(self):
+        torch.manual_seed(4)
+        data, interpolated, times, _ = _fixture(sizes=(5, 3, 6), t=0.4, seed=24)
+
+        target, _ = permutation_target(data, interpolated, times, "mcmc", mcmc_iters=50)
+
+        mask = data["mask"]
+        for b in range(mask.size(0)):
+            n_b = int(mask[b].sum().item())
+            for key in ["coords", "atomics", "bonds"]:
+                self.assertTrue(torch.equal(target[key][b, n_b:], data[key][b, n_b:].float()))
+
+    def test_hard_fallback_when_temperature_underflows(self):
+        data, interpolated, times, _ = _fixture(t=1.0, seed=25)
+        eps = torch.full((3,), TARGET_MIN_EPS / 10.0)
+
+        target, diag = permutation_target(data, interpolated, times, "mcmc", eps_override=eps)
+
+        self.assertIs(target, data)
+        self.assertEqual(diag["target-hard-fallback-frac"].item(), 1.0)
+
+    def test_uniform_proposal_also_works(self):
+        torch.manual_seed(5)
+        data, interpolated, times, _ = _fixture(t=0.3, seed=26)
+
+        target, _ = permutation_target(
+            data, interpolated, times, "mcmc", mcmc_iters=50, mcmc_proposal="uniform"
+        )
+
+        mask = data["mask"]
+        for b in range(mask.size(0)):
+            n_b = int(mask[b].sum().item())
+            got = target["coords"][b, :n_b].sort(dim=0).values
+            want = data["coords"][b, :n_b].sort(dim=0).values
+            np.testing.assert_almost_equal(got.numpy(), want.numpy(), decimal=5)
+
+    def test_no_nan_or_inf_at_extreme_times(self):
+        for t in [0.0, 1e-8, 1.0 - 1e-8, 1.0]:
+            for sigma_val in [0.0, 0.2]:
+                torch.manual_seed(6)
+                data, interpolated, times, _ = _fixture(sizes=(5, 1, 6), t=t, seed=27)
+                target, _ = permutation_target(
+                    data, interpolated, times, "mcmc", noise_std=sigma_val, mcmc_iters=50
+                )
+                for key in ["coords", "atomics", "bonds", "charges"]:
+                    tensor = target[key]
+                    self.assertFalse(
+                        torch.isnan(tensor).any().item(), f"nan in {key} at t={t}, sigma={sigma_val}"
+                    )
+                    self.assertFalse(
+                        torch.isinf(tensor).any().item(), f"inf in {key} at t={t}, sigma={sigma_val}"
+                    )
+
+
 class ApplyPlanTests(unittest.TestCase):
     def _plan_from_perm(self, sigma, n):
         return torch.stack([F.one_hot(sigma[b], n).float() for b in range(sigma.size(0))])

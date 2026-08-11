@@ -35,8 +35,7 @@ axes. The original implementation conflated them; both are now separate flags, `
 | **Target** | given x_t, what to regress toward | hard / soft-averaged / sampled | blending is correct here |
 
 **Sinkhorn and MCMC belong on the target axis, not the coupling axis.**
-Coupling axis holds `{none, hungarian}`; target axis holds `{hard, sinkhorn}`, with `mcmc`
-reserved.
+Coupling axis holds `{none, hungarian}`; target axis holds `{hard, sinkhorn, mcmc}`.
 
 ### Why blending the noise is invalid (specification error, not approximation error)
 
@@ -131,12 +130,13 @@ to *where* Sinkhorn is applied, not to how it is implemented.
    removed from the coupling dispatch and `COUPLING_TYPES` is now `["none", "hungarian"]`. The
    solvers in `functional.py` and `molrepr.py:soft_permute` are untouched — they are correct and
    the target side needs them.
-2. **[FIXED] The target axis now exists.** `--target {hard,sinkhorn}` (default `hard`), independent
-   of `--coupling`, computed in the loss via `fm.py:permutation_target`. `mcmc` is the reserved
-   third value and is not implemented yet — recover its removed hyperparameters from
-   `git show d1c18eb~1:semlaflow/data/interpolate.py` when wiring it. `molrepr.py:soft_permute`
-   stays as the single-molecule reference; the loss uses its own batched `fm.py:apply_plan`, and
-   `tests/functional.py` pins the two against each other so their conventions cannot drift.
+2. **[FIXED] The target axis now exists.** `--target {hard,sinkhorn,mcmc}` (default `hard`),
+   independent of `--coupling`, computed in the loss via `fm.py:permutation_target`. Both soft
+   estimators share one cost, one eps schedule and one application path — `mcmc` returns a hard
+   permutation which `functional.py:permutation_to_plan` turns into a permutation matrix so it
+   goes through the same `fm.py:apply_plan` as Sinkhorn, rather than a parallel gather that could
+   drift. `molrepr.py:soft_permute` stays as the single-molecule reference and `tests/functional.py`
+   pins `apply_plan` against it so their conventions cannot drift either.
 3. **[FIXED] The cost is computed from x_t.** `cost[b,i,j] = ||x_t[b,i] - t*x1[b,j]||^2`, rows
    indexing x_t slots and columns x1 candidates. Not the old t-independent
    `inter_distances(to_coords, from_coords)` with t bolted on as a temperature.
@@ -323,13 +323,13 @@ Next, in priority order:
 
 1. [done] **Sinkhorn and MCMC removed from the coupling dispatch.**
        `COUPLING_TYPES = ["none","hungarian"]`; solvers and `soft_permute` kept.
-2. [done] **Target axis added** — `--target {hard,sinkhorn}`, cost from x_t,
-       `eps = 2((1-t)^2 + sigma^2)`, entropy-of-P-vs-t logged per epoch. `--target mcmc` is the
-       remaining piece: same cost and eps, `init_perm` = identity (x_t was built from x1 in index
-       order, so the identity IS the permutation that generated it — no scipy call needed in the
-       loss), `to_coords` = x_t coords for the knn proposal. Profile step time before any real run:
-       100 sequential tiny GPU kernels is a measurable overhead, and if the chain barely moves at
-       low t it is a hard arm in disguise and must be reported as one.
+2. [done] **Target axis added** — `--target {hard,sinkhorn,mcmc}`, cost from x_t,
+       `eps = 2((1-t)^2 + sigma^2)`, entropy-of-P-vs-t logged per epoch. MCMC uses `init_perm` =
+       identity (x_t was built from x1 in index order, so the identity IS the permutation that
+       generated it — no scipy call, no GPU->CPU sync in the loss) and `to_coords` = x_t coords for
+       the knn proposal. **Still owed: a GPU step-time profile on Isambard before any real run.**
+       On CPU at B=64/N=25 the target costs ~13 ms (sinkhorn, 100 it) vs ~9 ms (mcmc, 100 it), but
+       MCMC is kernel-launch-bound so the ordering may invert on GPU.
 3. [ ] **NFE sweep** {1,2,5,10,20,50,100}. Highest-value missing experiment: the mechanism
        predicts the gap *widens* at low NFE and nothing tests that. Everything so far ran at a
        fixed 100 steps; `--integration_steps` already exists on both scripts, so this is a sweep

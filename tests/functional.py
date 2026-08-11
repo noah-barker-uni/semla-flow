@@ -728,5 +728,53 @@ class PlanFromSinkhornFnsTests(unittest.TestCase):
             smolF.plan_from_sinkhorn(raw[:, :, :-1], node_mask)
 
 
+class PermutationToPlanFnsTests(unittest.TestCase):
+    def _perm(self, seq_lengths, seed):
+        torch.manual_seed(seed)
+        n = max(seq_lengths)
+        seq_lengths_t = torch.tensor(seq_lengths)
+        node_mask = (torch.arange(n).unsqueeze(0) < seq_lengths_t.unsqueeze(1)).long()
+        perm = torch.arange(n).unsqueeze(0).repeat(len(seq_lengths), 1).clone()
+        for b, n_b in enumerate(seq_lengths):
+            perm[b, :n_b] = torch.randperm(n_b)
+        return perm, node_mask, seq_lengths_t
+
+    def test_plan_applied_to_a_tensor_matches_a_gather(self):
+        perm, node_mask, seq_lengths = self._perm([5, 3, 6], seed=0)
+        x = torch.rand((3, node_mask.size(1), 4))
+
+        plan = smolF.permutation_to_plan(perm, node_mask)
+
+        np.testing.assert_almost_equal(
+            (plan @ x).numpy(), torch.gather(x, 1, perm.unsqueeze(2).expand(-1, -1, 4)).numpy(), decimal=6
+        )
+
+    def test_rows_sum_to_one_and_padding_is_identity(self):
+        perm, node_mask, seq_lengths = self._perm([5, 3, 6], seed=1)
+
+        plan = smolF.permutation_to_plan(perm, node_mask)
+
+        np.testing.assert_almost_equal(
+            plan.sum(dim=2).numpy(), torch.ones_like(plan.sum(dim=2)).numpy(), decimal=6
+        )
+        for b in range(3):
+            for i in range(seq_lengths[b].item(), node_mask.size(1)):
+                self.assertEqual(plan[b, i, i].item(), 1.0)
+
+    def test_identity_permutation_gives_the_identity_matrix(self):
+        n = 5
+        node_mask = torch.ones((2, n), dtype=torch.long)
+        perm = torch.arange(n).unsqueeze(0).repeat(2, 1)
+
+        plan = smolF.permutation_to_plan(perm, node_mask)
+
+        np.testing.assert_almost_equal(plan.numpy(), torch.eye(n).expand(2, n, n).numpy(), decimal=6)
+
+    def test_rejects_mismatched_perm_shape(self):
+        perm, node_mask, seq_lengths = self._perm([4, 4], seed=2)
+        with self.assertRaises(ValueError):
+            smolF.permutation_to_plan(perm[:, :-1], node_mask)
+
+
 if __name__ == "__main__":
     unittest.main()

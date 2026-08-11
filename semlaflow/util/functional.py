@@ -596,6 +596,34 @@ def plan_from_sinkhorn(
     return plan, row_dev
 
 
+def permutation_to_plan(perm: torch.Tensor, node_mask: torch.Tensor, dtype=torch.float32) -> torch.Tensor:
+    """Turn a hard permutation into the equivalent transport plan.
+
+    Lets a sampled permutation be applied through exactly the same code path as a sinkhorn plan,
+    rather than a parallel gather implementation that could drift from it. Padding rows are forced
+    to the identity, matching plan_from_sinkhorn.
+
+    Args:
+        perm (torch.Tensor): Permutation indices, shape [B, N] long.
+        node_mask (torch.Tensor): Shape [B, N], 1 for real (non-padding) positions.
+        dtype: Floating dtype of the returned plan.
+
+    Returns:
+        torch.Tensor: Permutation matrix, shape [B, N, N], with plan[b, i, perm[b, i]] = 1.
+    """
+
+    batch_size, n = node_mask.shape
+    if perm.shape != (batch_size, n):
+        raise ValueError(f"perm must have shape ({batch_size}, {n}), got {tuple(perm.shape)}.")
+
+    plan = torch.zeros((batch_size, n, n), dtype=dtype, device=perm.device)
+    plan.scatter_(2, perm.unsqueeze(2), 1.0)
+
+    valid = adj_from_node_mask(node_mask, self_connect=True).to(dtype)
+    pad_diag = torch.diag_embed(1.0 - node_mask.to(dtype))
+    return (plan * valid) + pad_diag
+
+
 def mcmc_permutation(
     cost: torch.Tensor,
     node_mask: torch.Tensor,
