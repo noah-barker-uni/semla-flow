@@ -409,6 +409,14 @@ Held fixed across every arm, deliberately: `--kabsch_align`, `--optimal_transpor
 `--coord_noise_std_dev 0.2` (it now enters the soft-target temperature schedule, so varying it
 would make arms incomparable), and `--seed`.
 
+**Wall time: QM9 300 epochs takes ~6-7 hours** (measured on earlier runs; `sacct` retention is too
+short to recover this, so it is recorded here). Request ~10h for hard/sinkhorn and ~14h for mcmc,
+whose per-step cost is the one genuine unknown. Do NOT pad to 24h "to be safe": Slurm bills
+elapsed rather than requested time, so over-requesting costs nothing directly, but the backfill
+scheduler can only slot a job into a gap at least as long as its requested limit — on a cluster
+sitting at ~1275/1320 nodes allocated, a 24h request skips every 7-24h gap and can delay the
+start substantially.
+
 ## Experimental design
 
 Fix architecture, data, optimizer, seeds, sampler. Hold SemlaFlow's "scale OT" (size handling)
