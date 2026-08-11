@@ -379,6 +379,36 @@ Next, in priority order:
        works throughout. The valency table is GEOM-Drugs-derived, so stability numbers become
        exactly comparable to Nikitin et al. once this runs.
 
+## Submitting runs on Isambard
+
+Batch scripts live at `/projects/b5bg/barkern.b5bg/sb_*.sh` (not in the repo — they hardcode
+cluster paths). The pattern that matters:
+
+```bash
+# One gate job, then the real runs behind --dependency=afterok on it
+sbatch sb_smoke_qm9.sh                       # 1 epoch x 3 targets, must exit non-zero on failure
+for COUPLING in none hungarian; do
+  for TARGET in hard sinkhorn mcmc; do
+    sbatch --dependency=afterok:<smoke_id> --job-name="qm9_${COUPLING}_${TARGET}" \
+           --export=ALL,COUPLING=$COUPLING,TARGET=$TARGET sb_train_qm9.sh
+  done
+done
+```
+
+Two traps, both hit already:
+
+- **A smoke job that loops over configs must track failures and `exit $FAILED`.** A bare loop
+  exits with the status of the *last* command, so `afterok` fires even when an arm crashed — the
+  gate is then worthless.
+- **The login node reaps long-running and memory-heavy processes.** Detached `nohup`/`setsid`
+  downloads were killed three times with an empty log, and loading GEOM's 915 MB `train.smol`
+  was OOM-killed (exit 137). Long downloads need a kept-alive foreground SSH session with a
+  resumable tool; anything that loads the full GEOM train split needs a compute node.
+
+Held fixed across every arm, deliberately: `--kabsch_align`, `--optimal_transport none`,
+`--coord_noise_std_dev 0.2` (it now enters the soft-target temperature schedule, so varying it
+would make arms incomparable), and `--seed`.
+
 ## Experimental design
 
 Fix architecture, data, optimizer, seeds, sampler. Hold SemlaFlow's "scale OT" (size handling)
