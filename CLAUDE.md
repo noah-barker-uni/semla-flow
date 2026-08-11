@@ -282,7 +282,24 @@ torch-scatter. Semla is pure PyTorch with dense attention. This is why ARM works
 - Account: `brics.b5bg` (NOT `b5bg`) — GPU allocation, use for training only
 - CPU allocation `b35bs.3.isambard` / `b35bs.macs3.isambard` is currently unused. **GFN2-xTB
   evaluation is CPU work and embarrassingly parallel — run it there** and keep b5bg GPU hours
-  for training.
+  for training: `python -m semlaflow.xtb_eval --sdf_path ... --n_workers 64`.
+
+### Getting xtb onto aarch64
+
+Non-obvious, because the usual routes do not exist: grimme-lab publishes **no aarch64 binary**
+(only linux-x86_64 and windows), and there is **no linux-aarch64 wheel for `tblite`** either. The
+PyPI `xtb` package fails to build. What does work is conda-forge, which builds xtb 6.7.1 for both
+`linux-aarch64` and `osx-arm64`. Isambard has no conda module, so use a standalone micromamba (a
+single static binary, available for linux-aarch64) or a bare conda prefix:
+
+```bash
+conda create -p /projects/b5bg/barkern.b5bg/envs/xtb -c conda-forge xtb
+export SEMLAFLOW_XTB_BINARY=/projects/b5bg/barkern.b5bg/envs/xtb/bin/xtb
+```
+
+`SEMLAFLOW_XTB_BINARY` (or `--xtb_binary`) exists so the xtb prefix does not have to be merged
+into the training venv. Extracting the `.conda` package by hand does NOT work — the binary needs
+its transitive conda deps (`libmctc-lib` and friends), so let the solver do it.
 - Partition: `workq`
 - Accounting: 1 node = 4 GH200, so 1 NHR = 4 GPU-hours; single-GPU job = 0.25 NHR/hour
 - Cluster is heavily loaded; interactive `--pty` jobs get stuck on `Reason: Priority`.
@@ -336,7 +353,11 @@ Next, in priority order:
        harness, not new metric code. Present as (a) metric vs NFE per arm; (b) the *difference*
        vs NFE with a zero line, so "the gap widens" is the literal shape of the curve; (c) "NFE
        required to reach threshold tau" as a single interpretable number.
-4. [ ] **GFN2-xTB pipeline** (see Metrics). New dependency, unverified on aarch64.
+4. [done] **GFN2-xTB pipeline** — `semlaflow/util/xtb.py` + `python -m semlaflow.xtb_eval`,
+       reading the SDF that `predict.py` already writes. Protocol matches
+       `isayevlab/geom-drugs-3dgen-evaluation` (`xtb <xyz> --opt --charge q --gfn 2`, dE_relax
+       read from the "total energy gain" line and negated) so numbers are comparable to their
+       table. **Still owed: run it on Isambard** — see the install note below.
 5. [ ] **Ryser estimator-bias comparison at n <= 12** — exact permanent marginals vs Sinkhorn vs
        MCMC on real cost matrices from the training loop. Cheap (CPU-seconds), disproportionate
        credibility: quantifies the mean-field bias the argument rests on instead of asserting it.
@@ -391,7 +412,8 @@ soft-vs-hard gap. Which wins is the empirical question and is why the factorial 
 
 Not just validity/uniqueness (these saturate and hide differences).
 
-**Primary energy metric is Delta-E_relax under GFN2-xTB**, reported as **both median and mean** —
+**Primary energy metric is Delta-E_relax under GFN2-xTB** (built: `semlaflow/xtb_eval.py`),
+reported as **both median and mean** —
 the distribution is heavily right-skewed (Nikitin et al.'s SemlaFlow numbers: median 32.3, mean
 91.0 +/- 21.7) and the two capture different failure modes: median = typical geometry quality,
 mean = rate of catastrophic failures.

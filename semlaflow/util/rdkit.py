@@ -126,6 +126,15 @@ def mol_is_valid(mol: Chem.rdchem.Mol, with_hs: bool = True, connected: bool = T
 def calc_energy(mol: Chem.rdchem.Mol, per_atom: bool = False) -> float:
     """Calculate the energy for an RDKit molecule using the MMFF forcefield
 
+    SECONDARY METRIC. MMFF is a coarse outlier filter for this project, not the energy metric to
+    report. Nikitin et al. (arXiv 2505.00169) show reference GEOM-Drugs conformers score mean
+    dE_relax ~16 kcal/mol under MMFF but ~0 under GFN2-xTB, because the dataset was built by
+    GFN2-xTB optimisation -- so MMFF's own error is larger than the effect being measured and
+    masks differences between models. The primary energy metric is GFN2-xTB dE_relax; see
+    semlaflow/util/xtb.py and semlaflow/xtb_eval.py. Everything MMFF-derived (energy, strain,
+    opt-rmsd, opt-energy-validity, energy-per-atom, strain-per-atom) inherits this caveat and is
+    correlated, so they are one signal, not six.
+
     The energy is only calculated for the first (0th index) conformer within the molecule. The molecule is copied so
     the original is not modified.
 
@@ -151,7 +160,10 @@ def calc_energy(mol: Chem.rdchem.Mol, per_atom: bool = False) -> float:
 
 
 def optimise_mol(mol: Chem.rdchem.Mol, max_iters: int = 1000) -> Chem.rdchem.Mol:
-    """Optimise the conformation of an RDKit molecule
+    """Optimise the conformation of an RDKit molecule, using MMFF
+
+    SECONDARY: see calc_energy on why MMFF is demoted here. The GFN2-xTB equivalent, which is the
+    one to report, is semlaflow.util.xtb.relax_molecule.
 
     Only the first (0th index) conformer within the molecule is optimised. The molecule is copied so the original
     is not modified.

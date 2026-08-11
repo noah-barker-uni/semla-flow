@@ -1,3 +1,16 @@
+"""Aggregate evaluation of a trained checkpoint: validity, stability, and MMFF-derived energies.
+
+Note on the energy numbers this reports. `energy`, `strain`, `opt-rmsd`, `opt-energy-validity`,
+`energy-per-atom` and `strain-per-atom` are all MMFF-derived, all correlated with each other, and
+all SECONDARY for this project -- MMFF's error against GEOM-Drugs reference conformers is larger
+than the effect being measured. Treat them as a coarse outlier filter.
+
+The primary energy metric is GFN2-xTB dE_relax, reported as both median and mean, together with
+per-molecule bond length / bond angle / torsion deviations against each molecule's own optimised
+counterpart. That runs separately, on CPU: generate with `python -m semlaflow.predict` (which
+writes an SDF), then `python -m semlaflow.xtb_eval` over that SDF.
+"""
+
 import argparse
 from functools import partial
 from pathlib import Path
