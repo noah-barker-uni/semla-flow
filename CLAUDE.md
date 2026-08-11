@@ -325,16 +325,24 @@ python -m semlaflow.train --data_path ... <args>
 
 - Repo: `/projects/b5bg/barkern.b5bg/semla-flow`
 - Venv: `/projects/b5bg/barkern.b5bg/venvs/equinv`
-- Data: `/projects/b5bg/barkern.b5bg/data`
+- Data: `/projects/b5bg/barkern.b5bg/data/qm9/smol` and `/projects/b5bg/barkern.b5bg/data/geom-drugs/smol`
 - Job outputs: `/projects/b5bg/barkern.b5bg/runs`
+- Checkpoints: `checkpoints_v2/<run_name>/` for the corrected runs. The pre-corrections runs are
+  preserved at `checkpoints_v1_exploratory/` — keep, do not cite (see "All existing Sinkhorn/MCMC
+  numbers are uninterpretable").
 
 ## Plan / status
 
-Environment, coupling implementation and evaluation harness are built. QM9, 300 epochs,
-`--optimal_transport none --kabsch_align`, seeds 12345/23456/34567 — all four old coupling arms
-trained, checkpoints in `checkpoints/<run_name>/` (naming is inconsistent for historical reasons;
-normalise with `--label_a`/`--label_b` at the call site). Those Sinkhorn/MCMC results are
-exploratory only — see "Known defects".
+Environment, both axes, the evaluation harness and the wandb instrumentation are built. The
+pre-corrections QM9 runs (all four old coupling arms x 3 seeds) are preserved at
+`checkpoints_v1_exploratory/` on Isambard and in the old `equinv-qm9` wandb project — exploratory
+only, see "Defects found in the original implementation".
+
+**The corrected runs are a clean slate.** `DEFAULT_RUN_SERIES = "v2"` in `train.py` sends them to
+the `equinv-<dataset>-v2` wandb project and `checkpoints_v2/`, so nothing mixes with the old
+experiments. Override with `--wandb_project` / `--checkpoint_dir`. Run names are
+`<coupling>_<target>_seed<seed>`, the arm is also in `wandb.config` as separate fields, and runs
+are grouped by arm so "mean +/- band across seeds" is two clicks rather than a CSV export.
 
 Next, in priority order:
 
@@ -417,6 +425,44 @@ soft-vs-hard gap. Which wins is the empirical question and is why the factorial 
 6. Performance stratified by molecule size — gap should grow with n
 7. Wall-clock per step — Sinkhorn O(n^2) batched should beat Hungarian O(n^3) sequential
 8. Entropy of P vs t — shows how much blending is actually happening
+
+### wandb instrumentation
+
+Spec: `docs/wandb_corrections.md`. **Nothing logged during training is a reported result** — every
+paper number comes from the post-hoc pipeline (GFN2-xTB, corrected valency table) on the CPU
+allocation. Training logging exists to catch a broken implementation in the first few hundred
+steps rather than after six hours.
+
+Everything in the method-diagnostics group is logged per step AND accumulated into 5 t-bins
+flushed each epoch (`<key>_t0`..`_t4`), because almost all of it is t-dependent and a scalar mean
+over a batch spanning every t hides the shape, which is the only thing these are for.
+
+| Key | Fires when | What a bad value means |
+|---|---|---|
+| `coupling/transport_cost` | every arm | straightness's un-gameable companion |
+| `coupling/frac_reassigned` | every arm | 0 on a hungarian arm ⇒ the coupling is not wired up |
+| `sinkhorn/plan_entropy` | sinkhorn | not falling with t ⇒ the eps schedule is not taking effect |
+| `sinkhorn/sum_p_squared` | sinkhorn | comparable to the 0.896 contraction figure in the old brief |
+| `sinkhorn/target_delta` | sinkhorn | ~0 ⇒ **the soft target is a no-op**; catch this on day one |
+| `sinkhorn/marginal_violation` | sinkhorn | large ⇒ P not doubly stochastic, everything downstream suspect |
+| `mcmc/acceptance_rate` | mcmc | ~0 ⇒ knn proposal or temperature is wrong |
+| `mcmc/hamming_from_init` | mcmc | ~0 ⇒ the chain never moved; report it as a hard arm |
+| `train/{loss,coord_loss,type_loss,bond_loss,charge_loss}` | every arm | per-modality, since a change could help coords and hurt types |
+| `train/grad_norm`, `train/lr`, `perf/steps_per_sec` | every arm | steps_per_sec supports the O(n^2) vs O(n^3) wall-clock claim, and cannot be retrofitted without rerunning |
+
+**Validation is deliberately trimmed** to `validity`, `fc-validity`, `energy-validity`,
+`strain-per-atom` plus atom/molecule stability. Dropped: `uniqueness` and `novelty` (measured noise
+around 0.99 across every arm and seed — they cannot discriminate on QM9, and dropping novelty also
+removes a full train-set SMILES pass at startup), and three of the four MMFF metrics (`energy`,
+`strain`, `opt-rmsd`, `opt-energy-validity` are correlated, not four independent confirmations, and
+the optimising ones cost a forcefield minimisation per molecule per validation). **No GFN2-xTB
+during training** — seconds per molecule, it belongs post-hoc on `b35bs`.
+
+**Nothing influences training.** There is no `EarlyStopping` and no `ReduceLROnPlateau` anywhere.
+`ModelCheckpoint(monitor="val-validity")` only decides which extra file is kept as `best.ckpt`;
+every arm trains a fixed number of epochs and evaluation uses `last.ckpt`, so checkpoint selection
+is identical across arms. Preserve that — arms stopping at different epochs would silently break
+the comparison.
 
 ### Metrics
 

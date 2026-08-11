@@ -253,11 +253,14 @@ class GeometricInterpolant(Interpolant):
             from_mols = [mol.zero_com() for mol in from_mols]
             to_mols = [mol.zero_com() for mol in to_mols]
             from_mols = self._ot_map(from_mols, to_mols)
+            reassigned = [0.0] * batch_size
 
         # Within match_mols either just truncate noise to match size of data molecule
         # Or also couple and optionally rotate the noise to best match data molecule
         else:
-            from_mols = [self._match_mols(from_mol, to_mol) for from_mol, to_mol in zip(from_mols, to_mols)]
+            matched = [self._match_mols(from_mol, to_mol) for from_mol, to_mol in zip(from_mols, to_mols)]
+            from_mols = [mol for mol, _ in matched]
+            reassigned = [frac for _, frac in matched]
 
         if self.fixed_time is not None:
             times = torch.tensor([self.fixed_time] * batch_size)
@@ -266,7 +269,13 @@ class GeometricInterpolant(Interpolant):
 
         tuples = zip(from_mols, to_mols, times.tolist())
         interp_mols = [self._interpolate_mol(from_mol, to_mol, t) for from_mol, to_mol, t in tuples]
-        return from_mols, to_mols, interp_mols, list(times)
+
+        # Carried through collation as a fifth batch column so the coupling's own behaviour is
+        # loggable from training_step -- the permutation itself is not recoverable from the batch,
+        # and an accumulator inside the interpolant would be per-DataLoader-worker and never reach
+        # the logger.
+        coupling_stats = [torch.tensor(frac) for frac in reassigned]
+        return from_mols, to_mols, interp_mols, list(times), coupling_stats
 
     def _ot_map(self, from_mols: list[GeometricMol], to_mols: list[GeometricMol]) -> list[GeometricMol]:
         """Permute the from_mols batch so that it forms an approximate mini-batch OT map with to_mols"""
@@ -276,7 +285,7 @@ class GeometricInterpolant(Interpolant):
 
         # Create matrix with to mols on outer axis and from mols on inner axis
         for to_mol in to_mols:
-            best_from_mols = [self._match_mols(from_mol, to_mol) for from_mol in from_mols]
+            best_from_mols = [self._match_mols(from_mol, to_mol)[0] for from_mol in from_mols]
             best_costs = [self._match_cost(mol, to_mol) for mol in best_from_mols]
             mol_matrix.append(list(best_from_mols))
             cost_matrix.append(list(best_costs))
@@ -285,7 +294,7 @@ class GeometricInterpolant(Interpolant):
         best_from_mols = [mol_matrix[r][c] for r, c in zip(row_indices, col_indices)]
         return best_from_mols
 
-    def _match_mols(self, from_mol: GeometricMol, to_mol: GeometricMol) -> GeometricMol:
+    def _match_mols(self, from_mol: GeometricMol, to_mol: GeometricMol) -> tuple[GeometricMol, float]:
         """Couple the from_mol to the to_mol, optionally Kabsch-align, and return the result
 
         The coupling must be a genuine permutation: an x1-dependent alignment only preserves the
@@ -293,6 +302,10 @@ class GeometricInterpolant(Interpolant):
         group. Doubly stochastic (soft) plans are convex combinations of permutations, not group
         elements, so applying one here contracts the noise -- see docs/Sinkhorn_corrections.md.
         Soft plans belong on the target axis, not here.
+
+        Returns:
+            tuple[GeometricMol, float]: The coupled prior molecule, and the fraction of its slots
+                the coupling reassigned (0.0 for coupling="none").
         """
 
         if to_mol.seq_length > from_mol.seq_length:
@@ -303,20 +316,28 @@ class GeometricInterpolant(Interpolant):
 
         # Keep the same number of atoms as the data mol in the noise mol
         from_mol = from_mol.permute(list(range(to_mol.seq_length)))
+        frac_reassigned = 0.0
 
         if self.coupling == "none":
-            return from_mol
+            return from_mol, frac_reassigned
 
         cost_matrix = smolF.inter_distances(to_mol.coords.cpu(), from_mol.coords.cpu(), sqrd=True)
 
         if self.coupling == "hungarian":
             _, from_mol_indices = linear_sum_assignment(cost_matrix.numpy())
+
+            # Fraction of slots the coupling actually moved. If this sits at 0 the coupling is a
+            # no-op and the arm is secretly coupling="none"; it is the cheapest possible check that
+            # the assignment step is wired up at all.
+            n = len(from_mol_indices)
+            frac_reassigned = float((from_mol_indices != np.arange(n)).sum()) / max(n, 1)
+
             from_mol = from_mol.permute(from_mol_indices.tolist())
 
         if not self.kabsch_align:
-            return from_mol
+            return from_mol, frac_reassigned
 
-        return self._kabsch_align(from_mol, to_mol)
+        return self._kabsch_align(from_mol, to_mol), frac_reassigned
 
     def _kabsch_align(self, from_mol: GeometricMol, to_mol: GeometricMol) -> GeometricMol:
         """Rigidly rotate from_mol onto to_mol (Kabsch/Wahba via SVD), assuming matching atom order"""

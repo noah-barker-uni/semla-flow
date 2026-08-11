@@ -60,6 +60,11 @@ DEFAULT_TARGET_MCMC_ITERS = 100
 DEFAULT_TARGET_MCMC_PROPOSAL = "knn"
 DEFAULT_TARGET_MCMC_KNN_K = 8
 
+# Bumped so the corrected runs land in their own wandb project and their own checkpoint tree,
+# separate from the pre-corrections experiments. Override with --wandb_project / --checkpoint_dir.
+DEFAULT_RUN_SERIES = "v2"
+DEFAULT_CHECKPOINT_DIR = "checkpoints_v2"
+
 
 def build_model(args, dm, vocab):
     # Get hyperparameeters from the datamodule, pass these into the model to be saved
@@ -155,7 +160,10 @@ def build_model(args, dm, vocab):
         )
 
     train_steps = util.calc_train_steps(dm, args.epochs, args.acc_batches)
-    train_smiles = None if args.trial_run else [mols.str_id for mols in dm.train_dataset]
+    # Was only used to build the novelty metric, which is dropped (it measured noise around 0.99
+    # across every arm). Kept as None so the constructor signature is unchanged, but the full
+    # train-set SMILES pass and RDKit mol construction it used to trigger no longer run.
+    train_smiles = None
 
     print(f"Total training steps {train_steps}")
 
@@ -327,14 +335,46 @@ def build_trainer(args):
     log_steps = 1 if args.trial_run else 50
     val_check_epochs = 1 if args.trial_run else args.val_check_epochs
 
-    project_name = f"{util.PROJECT_PREFIX}-{args.dataset}"
-    run_name = args.run_name if args.run_name is not None else f"{args.coupling}-{args.target}"
+    project_name = args.wandb_project or f"{util.PROJECT_PREFIX}-{args.dataset}-{DEFAULT_RUN_SERIES}"
+    arm = f"{args.coupling}_{args.target}"
+    run_name = args.run_name if args.run_name is not None else f"{arm}_seed{args.seed}"
     print("Using precision '32'")
 
     logger = WandbLogger(project=project_name, name=run_name, save_dir="wandb", log_model=True)
+
+    # The arm definition goes into the config as SEPARATE FIELDS rather than being baked into the
+    # run name, and runs are grouped by arm. With group set, "mean +/- band per arm across seeds"
+    # is two clicks in the wandb UI and the convergence-curve figure comes almost directly out of
+    # it; without it you are exporting CSVs and re-plotting by hand. See docs/wandb_corrections.md.
+    logger.experiment.config.update(
+        {
+            "coupling": args.coupling,
+            "target": args.target,
+            "seed": args.seed,
+            "kabsch": args.kabsch_align,
+            "dataset": args.dataset,
+            "coord_noise_std_dev": args.coord_noise_std_dev,
+            "target_sinkhorn_iters": args.target_sinkhorn_iters,
+            "target_mcmc_iters": args.target_mcmc_iters,
+            "target_mcmc_proposal": args.target_mcmc_proposal,
+            "target_mcmc_knn_k": args.target_mcmc_knn_k,
+            "arm": arm,
+            "run_series": DEFAULT_RUN_SERIES,
+        },
+        allow_val_change=True,
+    )
+    logger.experiment.group = arm
+    logger.experiment.tags = tuple(logger.experiment.tags or ()) + (arm, f"seed{args.seed}", DEFAULT_RUN_SERIES)
+
     lr_monitor = LearningRateMonitor(logging_interval="step")
+
+    # monitor= only decides which extra file is kept as best.ckpt. It does NOT stop training and
+    # does not change the LR -- there is no EarlyStopping and no ReduceLROnPlateau anywhere in this
+    # repo, and every arm trains a fixed number of epochs. Evaluation uses last.ckpt, so checkpoint
+    # selection is identical across arms. Preserve that: different arms stopping at different
+    # epochs would silently break the comparison (docs/wandb_corrections.md 0).
     checkpointing = ModelCheckpoint(
-        dirpath=f"checkpoints/{run_name}",
+        dirpath=str(Path(args.checkpoint_dir) / run_name),
         every_n_epochs=val_check_epochs,
         monitor="val-validity",
         mode="max",
@@ -467,6 +507,8 @@ if __name__ == "__main__":
         "--target_mcmc_proposal", type=str, default=DEFAULT_TARGET_MCMC_PROPOSAL, choices=["uniform", "knn"]
     )
     parser.add_argument("--target_mcmc_knn_k", type=int, default=DEFAULT_TARGET_MCMC_KNN_K)
+    parser.add_argument("--wandb_project", type=str, default=None)
+    parser.add_argument("--checkpoint_dir", type=str, default=DEFAULT_CHECKPOINT_DIR)
 
     parser.set_defaults(
         trial_run=False,

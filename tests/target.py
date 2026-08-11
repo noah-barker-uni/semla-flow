@@ -166,8 +166,8 @@ class PermutationTargetTests(unittest.TestCase):
             target, diag = permutation_target(
                 data, interpolated, times, "sinkhorn", noise_std=0.0, sinkhorn_iters=200
             )
-            entropies.append(diag["target-plan-entropy"].item())
-            shifts.append(diag["target-coord-shift"].item())
+            entropies.append(diag["sinkhorn/plan_entropy"].mean().item())
+            shifts.append(diag["sinkhorn/target_delta"].mean().item())
 
         for earlier, later in zip(entropies, entropies[1:]):
             self.assertLessEqual(later, earlier + 1e-6)
@@ -185,8 +185,8 @@ class PermutationTargetTests(unittest.TestCase):
             data, interpolated, times, "sinkhorn", noise_std=0.2, sinkhorn_iters=200
         )
 
-        self.assertGreater(diag["target-eps"].item(), 0.0)
-        self.assertLess(diag["target-coord-shift"].item(), 1e-2)
+        self.assertGreater(diag["target/eps"].mean().item(), 0.0)
+        self.assertLess(diag["sinkhorn/target_delta"].mean().item(), 1e-2)
         np.testing.assert_almost_equal(
             target["coords"].numpy(), _gather_hard(data, sigma)["coords"].numpy(), decimal=2
         )
@@ -199,8 +199,8 @@ class PermutationTargetTests(unittest.TestCase):
             data, interpolated, times, "sinkhorn", noise_std=0.0, sinkhorn_iters=200
         )
 
-        self.assertGreater(diag["target-plan-entropy"].item(), 0.9)
-        self.assertGreater(diag["target-eff-atoms"].item(), 2.5)
+        self.assertGreater(diag["sinkhorn/plan_entropy"].mean().item(), 0.9)
+        self.assertGreater((1.0 / diag["sinkhorn/sum_p_squared"]).mean().item(), 2.5)
 
     def test_eps_schedule_is_twice_the_conditional_variance(self):
         for t, sigma_val in [(0.0, 0.0), (0.5, 0.0), (0.9, 0.2), (1.0, 0.2)]:
@@ -209,7 +209,7 @@ class PermutationTargetTests(unittest.TestCase):
                 data, interpolated, times, "sinkhorn", noise_std=sigma_val, sinkhorn_iters=5
             )
             expected = 2.0 * ((1.0 - t) ** 2 + sigma_val ** 2)
-            self.assertAlmostEqual(diag["target-eps"].item(), expected, places=5)
+            self.assertAlmostEqual(diag["target/eps"].mean().item(), expected, places=5)
 
     def test_hard_fallback_when_temperature_underflows(self):
         data, interpolated, times, _ = _fixture(t=1.0, seed=9)
@@ -220,7 +220,7 @@ class PermutationTargetTests(unittest.TestCase):
         )
 
         self.assertIs(target, data)
-        self.assertEqual(diag["target-hard-fallback-frac"].item(), 1.0)
+        self.assertEqual(diag["target/hard_fallback_frac"].mean().item(), 1.0)
 
     def test_no_nan_or_inf_at_extreme_times(self):
         for t in [0.0, 1e-8, 1.0 - 1e-8, 1.0]:
@@ -295,7 +295,7 @@ class McmcTargetTests(unittest.TestCase):
         )
 
         self.assertTrue(torch.equal(target["coords"], data["coords"]))
-        self.assertAlmostEqual(diag["target-move-frac"].item(), 0.0, places=6)
+        self.assertAlmostEqual(diag["mcmc/hamming_from_init"].mean().item(), 0.0, places=6)
 
     def test_move_fraction_is_reported_and_grows_as_t_falls(self):
         """The diagnostic that decides whether this arm means anything.
@@ -312,7 +312,7 @@ class McmcTargetTests(unittest.TestCase):
             _, diag = permutation_target(
                 data, interpolated, times, "mcmc", noise_std=0.0, mcmc_iters=100
             )
-            fracs.append(diag["target-move-frac"].item())
+            fracs.append(diag["mcmc/hamming_from_init"].mean().item())
 
         self.assertGreater(fracs[0], fracs[1])
         self.assertGreater(fracs[0], 0.0)
@@ -336,7 +336,7 @@ class McmcTargetTests(unittest.TestCase):
         target, diag = permutation_target(data, interpolated, times, "mcmc", eps_override=eps)
 
         self.assertIs(target, data)
-        self.assertEqual(diag["target-hard-fallback-frac"].item(), 1.0)
+        self.assertEqual(diag["target/hard_fallback_frac"].mean().item(), 1.0)
 
     def test_uniform_proposal_also_works(self):
         torch.manual_seed(5)

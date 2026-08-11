@@ -38,7 +38,7 @@ class GeometricInterpolantCouplingTests(unittest.TestCase):
         interpolant = _build_interpolant(coupling="none", kabsch_align=True, fixed_time=0.5)
         to_mols = _sample_to_mols()
 
-        from_mols, returned_to_mols, interp_mols, times = interpolant.interpolate(to_mols)
+        from_mols, returned_to_mols, interp_mols, times, _ = interpolant.interpolate(to_mols)
 
         for from_mol, to_mol in zip(from_mols, returned_to_mols):
             self.assertEqual(from_mol.seq_length, to_mol.seq_length)
@@ -47,7 +47,7 @@ class GeometricInterpolantCouplingTests(unittest.TestCase):
         interpolant = _build_interpolant(coupling="hungarian", kabsch_align=True, fixed_time=0.5)
         to_mols = _sample_to_mols()
 
-        from_mols, returned_to_mols, interp_mols, times = interpolant.interpolate(to_mols)
+        from_mols, returned_to_mols, interp_mols, times, _ = interpolant.interpolate(to_mols)
 
         self.assertEqual(len(from_mols), len(to_mols))
         for from_mol, to_mol in zip(from_mols, returned_to_mols):
@@ -57,7 +57,7 @@ class GeometricInterpolantCouplingTests(unittest.TestCase):
         interpolant = _build_interpolant(coupling="hungarian", kabsch_align=True, fixed_time=0.5)
         to_mols = _sample_to_mols_varied([4, 6, 5])
 
-        from_mols, returned_to_mols, interp_mols, times = interpolant.interpolate(to_mols)
+        from_mols, returned_to_mols, interp_mols, times, _ = interpolant.interpolate(to_mols)
 
         self.assertEqual(len(from_mols), len(to_mols))
         for from_mol, to_mol in zip(from_mols, returned_to_mols):

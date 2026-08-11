@@ -633,7 +633,8 @@ def mcmc_permutation(
     proposal: str = "knn",
     knn_k: int = 8,
     to_coords: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    return_stats: bool = False,
+):
     """Batched Metropolis sampling over permutations via transposition proposals.
 
     Targets p(perm) ~ exp(-cost(perm) / eps) on the same cost matrix used for hungarian/sinkhorn
@@ -656,8 +657,14 @@ def mcmc_permutation(
             only used) if proposal == "knn" -- this is the fixed geometry the swap positions live
             in (to_mol coords), not the candidates being assigned.
 
+        return_stats (bool): Also return sampler diagnostics. Off by default so every existing
+            caller keeps the plain-tensor return.
+
     Returns:
-        torch.Tensor: Final permutation, shape [B, N] long.
+        torch.Tensor: Final permutation, shape [B, N] long. If return_stats, instead returns
+            (perm, {"acceptance_rate": [B], "hamming_from_init": [B]}) -- an acceptance rate near 0
+            means the proposal or the temperature is wrong, and a hamming distance of 0 means the
+            chain never left its starting permutation.
     """
 
     if proposal not in ("uniform", "knn"):
@@ -681,6 +688,9 @@ def mcmc_permutation(
 
     # No valid swap is possible anywhere in the batch (also avoids a degenerate k=0 topk below)
     if n < 2:
+        if return_stats:
+            zeros = torch.zeros(batch_size, dtype=cost.dtype, device=cost.device)
+            return perm, {"acceptance_rate": zeros, "hamming_from_init": zeros.clone()}
         return perm
 
     knn_adj = None
@@ -689,6 +699,7 @@ def mcmc_permutation(
         knn_adj = edges_from_nodes(to_coords, k=k_eff, node_mask=node_mask, edge_format="adjacency")
 
     batch_idx = torch.arange(batch_size, device=cost.device)
+    n_accepted = torch.zeros(batch_size, dtype=cost.dtype, device=cost.device)
 
     for _ in range(n_iters):
         i = torch.multinomial(node_mask.float(), 1)
@@ -723,8 +734,17 @@ def mcmc_permutation(
         new_ip = torch.where(accept, perm_i, perm_ip)
         perm[batch_idx, i_] = new_i
         perm[batch_idx, ip_] = new_ip
+        n_accepted += accept.to(cost.dtype)
 
-    return perm
+    if not return_stats:
+        return perm
+
+    real = node_mask.to(cost.dtype)
+    stats = {
+        "acceptance_rate": n_accepted / max(n_iters, 1),
+        "hamming_from_init": ((perm != init_perm).to(cost.dtype) * real).sum(dim=1),
+    }
+    return perm, stats
 
 
 def calc_com(coords, node_mask=None):

@@ -1,3 +1,4 @@
+import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Optional
@@ -25,8 +26,26 @@ _BatchT = dict[str, _T]
 # is linear in the target, so the expected gradient depends on the target only through its mean.
 TARGET_TYPES = ["hard", "sinkhorn", "mcmc"]
 
-# Number of t buckets the plan-entropy-vs-t curve is accumulated into over an epoch.
-TARGET_T_BINS = 10
+# Number of t buckets the method diagnostics are accumulated into over an epoch. Almost all the
+# interesting behaviour is t-dependent and a scalar mean over the batch hides it entirely; 5 bins
+# is enough to see the shape.
+TARGET_T_BINS = 5
+
+# Method diagnostics that are accumulated per t-bin as well as logged per step. Namespaced so the
+# wandb UI groups them; see docs/wandb_corrections.md.
+BUCKETED_DIAGNOSTICS = [
+    "sinkhorn/plan_entropy",
+    "sinkhorn/sum_p_squared",
+    "sinkhorn/target_delta",
+    "sinkhorn/marginal_violation",
+    "mcmc/target_delta",
+    "mcmc/acceptance_rate",
+    "mcmc/hamming_from_init",
+    "coupling/transport_cost",
+    "coupling/frac_reassigned",
+]
+
+_BUCKETED_INDEX = {name: index for index, name in enumerate(BUCKETED_DIAGNOSTICS)}
 
 # Temperature below which the entropic plan is replaced by its exact zero-temperature limit.
 #
@@ -131,6 +150,9 @@ def permutation_target(
     if not bool(soft_ok.any()):
         return data, _target_diagnostics(data, data, interpolated, None, times, eps, soft_ok, None)
 
+    mcmc_stats = None
+    col_dev = None
+
     # Rows index x_t slots, columns index x1 candidates. That orientation is what makes
     # target = P @ x1 match GeometricMol.soft_permute's convention.
     scaled_data_coords = times.view(-1, 1, 1) * data["coords"]
@@ -141,6 +163,14 @@ def permutation_target(
     if target == "sinkhorn":
         raw_plan = smolF.sinkhorn_batched(cost, mask, eps_safe, n_iters=sinkhorn_iters)
         plan, row_dev = smolF.plan_from_sinkhorn(raw_plan, mask)
+
+        # Column deviation is measured on the RAW plan, before plan_from_sinkhorn renormalises the
+        # rows -- afterwards the columns are no longer expected to sum to 1, so measuring there
+        # would report a violation that is by design rather than a convergence failure.
+        valid = smolF.adj_from_node_mask(mask, self_connect=True).to(raw_plan.dtype)
+        masked_raw = raw_plan * valid
+        col_sums = masked_raw.sum(dim=1) + (1.0 - mask.to(raw_plan.dtype))
+        col_dev = (col_sums - 1.0).abs().amax(dim=1)
 
     else:
         # The coupling permuted the PRIOR, leaving x1 in its original index order, so x_t[i] was
@@ -162,7 +192,9 @@ def permutation_target(
             # ever accepted when x_t[i] is near x_t[i'], so the knn graph lives in x_t space. Using
             # x1 coords here would be nearly right as t -> 1 and badly wrong at small t.
             to_coords=interpolated["coords"],
+            return_stats=True,
         )
+        perm, mcmc_stats = perm
         plan = smolF.permutation_to_plan(perm, mask, dtype=cost.dtype)
         row_dev = None
 
@@ -172,7 +204,8 @@ def permutation_target(
 
     target_batch = apply_plan(plan, data)
     diagnostics = _target_diagnostics(
-        target_batch, data, interpolated, plan, times, eps, soft_ok, row_dev
+        target_batch, data, interpolated, plan, times, eps, soft_ok, row_dev, col_dev, mcmc_stats,
+        target_name=target,
     )
     return target_batch, diagnostics
 
@@ -231,15 +264,22 @@ def _target_diagnostics(
     eps: _T,
     soft_ok: _T,
     row_dev: Optional[_T],
+    col_dev: Optional[_T] = None,
+    mcmc_stats: Optional[dict] = None,
+    target_name: str = "sinkhorn",
 ) -> dict[str, _T]:
-    """Per-step scalars describing how much blending actually happened.
+    """Per-sample method diagnostics, named and namespaced per docs/wandb_corrections.md.
 
-    x_t is built from the coupling's permutation and the posterior is then computed from x_t, so
-    the plan is peaked on that permutation by construction. That makes "is anything actually
-    blending" an empirical question rather than an assumption, which is what these measure.
+    Every value is [B] rather than a scalar, so the caller can both log the batch mean and
+    accumulate the t-binned curve -- almost everything here is t-dependent and a scalar mean over
+    a batch spanning all t hides the shape entirely.
 
-    Every value is a scalar except target-plan-entropy-per-sample, which is [B] so the caller can
-    accumulate the entropy-vs-t curve.
+    These are chosen so a broken implementation announces itself in minutes:
+      sinkhorn/target_delta flat at ~0     -> the soft target is not actually soft
+      sinkhorn/plan_entropy not falling    -> the eps schedule is not taking effect
+      sinkhorn/marginal_violation large    -> P is not doubly stochastic, everything downstream suspect
+      mcmc/acceptance_rate ~0              -> proposal restriction or temperature is wrong
+      mcmc/hamming_from_init ~0            -> the chain never moved; this is a hard arm in disguise
     """
 
     mask = data["mask"]
@@ -254,46 +294,51 @@ def _target_diagnostics(
     measured_var = resid.pow(2).sum(dim=(1, 2)) / (3.0 * n_real)
 
     diagnostics = {
-        "target-eps": eps.mean(),
-        "target-hard-fallback-frac": (~soft_ok).to(dtype).mean(),
-        "target-eps-ratio": (measured_var / (0.5 * eps).clamp_min(1e-12)).mean(),
+        "target/eps": eps,
+        "target/hard_fallback_frac": (~soft_ok).to(dtype),
+        "target/eps_ratio": measured_var / (0.5 * eps).clamp_min(1e-12),
     }
 
     if plan is None:
         return diagnostics
 
-    if row_dev is not None:
-        diagnostics["target-row-sum-dev"] = row_dev.mean()
-
     log_plan = plan.clamp_min(1e-12).log()
     row_entropy = -(plan * log_plan).sum(dim=2)
     norm_entropy = (row_entropy * mask_f).sum(dim=1) / (n_real * n_real.clamp_min(2.0).log())
-    eff_atoms = (mask_f / plan.pow(2).sum(dim=2).clamp_min(1e-12)).sum(dim=1) / n_real
-    plan_diag = (plan.diagonal(dim1=1, dim2=2) * mask_f).sum(dim=1) / n_real
 
-    # For a sampled hard permutation the entropy diagnostics are all degenerate (entropy 0, one
-    # effective atom), so the only thing that says whether the chain went anywhere is how many
-    # slots moved off the identity it started from. If this sits near 0 the arm is a hard arm in
-    # disguise and has to be reported as one, not as a soft-target result.
-    diagnostics["target-move-frac"] = 1.0 - plan_diag.mean()
+    # Directly comparable to the contraction table in the old brief: sum_j P_ij^2 was 0.896 there,
+    # ie. the plan was still mixing ~1.12 atoms where it should have been hard. Seeing it on the
+    # TARGET side is expected; seeing it anywhere near the prior would mean the bug is back.
+    sum_p_squared = (plan.pow(2).sum(dim=2) * mask_f).sum(dim=1) / n_real
 
-    coord_shift = ((target["coords"] - data["coords"]) * mask_f.unsqueeze(2)).pow(2).sum(dim=(1, 2))
-    coord_norm = (data["coords"] * mask_f.unsqueeze(2)).pow(2).sum(dim=(1, 2)).clamp_min(1e-12)
+    # ||P x1 - pi(x1)||, per real atom. pi(x1) is the hard target, ie. x1 in index order. If this
+    # sits at ~0 the soft target is numerically identical to the hard one and the arm is a no-op.
+    delta = ((target["coords"] - data["coords"]) * mask_f.unsqueeze(2)).pow(2).sum(dim=(1, 2))
+    target_delta = (delta / n_real).sqrt()
 
-    # CE against a soft label q is H(q) + KL(q||p). H(q) is a target-only constant that inflates
-    # the reported type/bond losses without touching gradients, so log it to keep the reported
-    # numbers comparable across arms.
     label_entropy = -(target["atomics"] * target["atomics"].clamp_min(1e-12).log()).sum(dim=-1)
     label_entropy = (label_entropy * mask_f).sum(dim=1) / n_real
 
-    diagnostics.update({
-        "target-plan-entropy": norm_entropy.mean(),
-        "target-eff-atoms": eff_atoms.mean(),
-        "target-plan-diag": plan_diag.mean(),
-        "target-coord-shift": (coord_shift / coord_norm).sqrt().mean(),
-        "target-label-entropy": label_entropy.mean(),
-        "target-plan-entropy-per-sample": norm_entropy,
-    })
+    # target_delta is meaningful for either estimator, so it is namespaced by whichever produced
+    # the plan. The entropy and sum_p_squared pair are not: for a sampled hard permutation they are
+    # identically 0 and 1, and logging degenerate constants just adds noise to the UI.
+    diagnostics[f"{target_name}/target_delta"] = target_delta
+    diagnostics["target/label_entropy"] = label_entropy
+
+    if target_name == "sinkhorn":
+        diagnostics["sinkhorn/plan_entropy"] = norm_entropy
+        diagnostics["sinkhorn/sum_p_squared"] = sum_p_squared
+
+        # Worst deviation of any row OR column sum from 1, before renormalisation. Sinkhorn not
+        # converged => P not doubly stochastic => every target built from it is suspect.
+        if row_dev is not None:
+            violation = row_dev if col_dev is None else torch.maximum(row_dev, col_dev)
+            diagnostics["sinkhorn/marginal_violation"] = violation
+
+    if mcmc_stats is not None:
+        diagnostics["mcmc/acceptance_rate"] = mcmc_stats["acceptance_rate"]
+        diagnostics["mcmc/hamming_from_init"] = mcmc_stats["hamming_from_init"]
+
     return diagnostics
 
 
@@ -730,8 +775,10 @@ class MolecularCFM(L.LightningModule):
 
         # persistent=False is load-bearing: these must never enter state_dict, or a checkpoint
         # written by a soft arm stops loading in an arm that does not define them
-        self.register_buffer("_plan_entropy_sum", torch.zeros(TARGET_T_BINS), persistent=False)
-        self.register_buffer("_plan_entropy_count", torch.zeros(TARGET_T_BINS), persistent=False)
+        n_bucketed = len(BUCKETED_DIAGNOSTICS)
+        self._last_step_time = None
+        self.register_buffer("_diag_sum", torch.zeros(n_bucketed, TARGET_T_BINS), persistent=False)
+        self.register_buffer("_diag_count", torch.zeros(n_bucketed, TARGET_T_BINS), persistent=False)
 
         builder = MolBuilder(vocab)
 
@@ -777,27 +824,24 @@ class MolecularCFM(L.LightningModule):
             "atom-stability": Metrics.AtomStability(),
             "molecule-stability": Metrics.MoleculeStability()
         }
+        # Deliberately trimmed -- see docs/wandb_corrections.md 3. These answer "is this run
+        # learning / has it diverged", which is all validation is for here; the discriminating
+        # numbers (GFN2-xTB dE_relax, geometry deviations) are computed post-hoc on CPU.
+        #
+        # Dropped: uniqueness and novelty, which measured noise around 0.99 across every arm and
+        # seed and cannot discriminate between reasonable models on QM9. Also three of the four
+        # MMFF metrics -- energy, strain, opt-rmsd and opt-energy-validity are correlated, not four
+        # independent confirmations, and the two optimising ones cost a forcefield minimisation per
+        # molecule per validation for no extra signal. strain-per-atom is kept as the single coarse
+        # "is the geometry sane" check.
+        #
+        # NOT added: GFN2-xTB. It is seconds per molecule and would dominate training time.
         gen_metrics = {
             "validity": Metrics.Validity(),
             "fc-validity": Metrics.Validity(connected=True),
-            "uniqueness": Metrics.Uniqueness(),
             "energy-validity": Metrics.EnergyValidity(),
-            "opt-energy-validity": Metrics.EnergyValidity(optimise=True),
-            "energy": Metrics.AverageEnergy(),
-            "energy-per-atom": Metrics.AverageEnergy(per_atom=True),
-            "strain": Metrics.AverageStrainEnergy(),
             "strain-per-atom": Metrics.AverageStrainEnergy(per_atom=True),
-            "opt-rmsd": Metrics.AverageOptRmsd()
         }
-
-        if train_smiles is not None:
-            print("Creating RDKit mols from training SMILES...")
-            train_mols = self.builder.mols_from_smiles(train_smiles, explicit_hs=True)
-            train_mols = [mol for mol in train_mols if mol is not None]
-
-            print("Initialising novelty metric...")
-            gen_metrics["novelty"] = Metrics.Novelty(train_mols)
-            print("Novelty metric complete.")
 
         self.stability_metrics = MetricCollection(stability_metrics, compute_groups=False)
         self.gen_metrics = MetricCollection(gen_metrics, compute_groups=False)
@@ -857,7 +901,7 @@ class MolecularCFM(L.LightningModule):
         return out
 
     def training_step(self, batch, b_idx):
-        prior, data, interpolated, times = batch
+        prior, data, interpolated, times, coupling_stats = batch
 
         if self.distill:
             return self._distill_training_step(batch)
@@ -902,13 +946,63 @@ class MolecularCFM(L.LightningModule):
         losses = self._loss(data, interpolated, predicted, times)
         loss = sum(list(losses.values()))
 
+        # Per-modality split matters: a coupling/target change could plausibly help coordinates and
+        # hurt atom types, and an aggregate loss would hide that entirely.
         for name, loss_val in losses.items():
-            self.log(f"train-{name}", loss_val, on_step=True, logger=True)
+            self.log(f"train/{name.replace('-', '_')}", loss_val, on_step=True, logger=True)
 
-        self.log("train-loss", loss, prog_bar=True, on_step=True, logger=True)
-        self.log("train-transport-cost", self._transport_cost(prior, data), on_step=True, logger=True)
+        self.log("train/loss", loss, prog_bar=True, on_step=True, logger=True)
+        self._log_coupling_diagnostics(prior, data, times, coupling_stats)
+        self._log_throughput()
 
         return loss
+
+    def _log_coupling_diagnostics(self, prior, data, times, coupling_stats):
+        """Coupling-axis diagnostics, logged for every arm including target=hard.
+
+        transport_cost is straightness's un-gameable companion; frac_reassigned is the cheapest
+        possible check that the coupling is doing anything at all (it is identically 0 for
+        coupling=none, so a hungarian arm reading 0 means the assignment step is not wired up).
+        """
+
+        transport = self._transport_cost(prior, data)
+        reassigned = coupling_stats.to(transport.dtype)
+
+        for name, value in [("coupling/transport_cost", transport), ("coupling/frac_reassigned", reassigned)]:
+            self._accumulate_bucketed(name, value, times)
+            self.log(name, value.mean(), on_step=True, logger=True)
+
+    def _log_throughput(self):
+        """Steps per second, for the wall-clock claim that Sinkhorn O(n^2) beats Hungarian O(n^3).
+
+        Retrofitting this later would mean rerunning everything, so it is logged from the start.
+        """
+
+        now = time.perf_counter()
+        if self._last_step_time is not None:
+            elapsed = now - self._last_step_time
+            if elapsed > 0:
+                self.log("perf/steps_per_sec", 1.0 / elapsed, on_step=True, logger=True)
+
+        self._last_step_time = now
+
+    def on_before_optimizer_step(self, optimizer):
+        """Gradient norm, which catches instability well before the loss curve shows it."""
+
+        total = torch.linalg.vector_norm(
+            torch.stack([
+                torch.linalg.vector_norm(p.grad.detach()) for p in self.parameters() if p.grad is not None
+            ])
+        ) if any(p.grad is not None for p in self.parameters()) else None
+
+        if total is not None:
+            self.log("train/grad_norm", total, on_step=True, logger=True)
+
+        scheduler = self.lr_schedulers()
+        if scheduler is not None:
+            lrs = scheduler.get_last_lr()
+            if lrs:
+                self.log("train/lr", lrs[0], on_step=True, logger=True)
 
     @torch.no_grad()
     def _transport_cost(self, prior, data):
@@ -923,29 +1017,41 @@ class MolecularCFM(L.LightningModule):
 
         mask = data["mask"].unsqueeze(2)
         diff = (data["coords"] - prior["coords"]) * mask
-        per_mol = diff.pow(2).sum(dim=2).sum(dim=1) / data["mask"].sum(dim=1).clamp_min(1)
-        return per_mol.mean()
+        return diff.pow(2).sum(dim=2).sum(dim=1) / data["mask"].sum(dim=1).clamp_min(1)
 
     def on_train_batch_end(self, outputs, batch, b_idx):
         if self.ema_gen is not None:
             self.ema_gen.update_parameters(self.gen)
 
     def on_train_epoch_end(self):
-        """Flush the plan-entropy-vs-t curve accumulated over the epoch.
+        """Flush the t-binned method diagnostics accumulated over the epoch.
 
-        Each step averages over a batch spanning many different t, so the entropy schedule is only
-        visible once binned by t -- which is the whole point of logging it.
+        Each step averages over a batch spanning many different t, so a scalar per step hides the
+        one thing these are for -- the SHAPE of each quantity against t. Binning and flushing per
+        epoch gives that curve straight out of the logger.
         """
 
-        if self.target == "hard":
+        means = self._diag_sum / self._diag_count.clamp_min(1.0)
+        for index, name in enumerate(BUCKETED_DIAGNOSTICS):
+            if self._diag_count[index].sum() == 0:
+                continue
+            for k in range(TARGET_T_BINS):
+                self.log(f"{name}_t{k}", means[index, k], on_epoch=True, logger=True, sync_dist=True)
+
+        self._diag_sum.zero_()
+        self._diag_count.zero_()
+
+    def _accumulate_bucketed(self, name, values, times):
+        """Add a per-sample [B] diagnostic into its t-bin totals."""
+
+        if name not in _BUCKETED_INDEX:
             return
 
-        means = self._plan_entropy_sum / self._plan_entropy_count.clamp_min(1.0)
-        for k in range(TARGET_T_BINS):
-            self.log(f"train-plan-entropy-t{k}", means[k], on_epoch=True, logger=True, sync_dist=True)
-
-        self._plan_entropy_sum.zero_()
-        self._plan_entropy_count.zero_()
+        index = _BUCKETED_INDEX[name]
+        bins = (times * TARGET_T_BINS).long().clamp_(0, TARGET_T_BINS - 1)
+        values = values.detach().to(self._diag_sum.dtype)
+        self._diag_sum[index].index_add_(0, bins, values)
+        self._diag_count[index].index_add_(0, bins, torch.ones_like(values))
 
     def _regression_target(self, data, interpolated, times):
         """Build the regression target and log how much blending it involved.
@@ -969,19 +1075,14 @@ class MolecularCFM(L.LightningModule):
             mcmc_knn_k=self.target_mcmc_knn_k,
         )
 
-        entropy = diagnostics.pop("target-plan-entropy-per-sample", None)
-        if entropy is not None:
-            bins = (times * TARGET_T_BINS).long().clamp_(0, TARGET_T_BINS - 1)
-            self._plan_entropy_sum.index_add_(0, bins, entropy.to(self._plan_entropy_sum.dtype))
-            self._plan_entropy_count.index_add_(0, bins, torch.ones_like(entropy, dtype=self._plan_entropy_count.dtype))
-
         for name, value in diagnostics.items():
-            self.log(f"train-{name}", value, on_step=True, logger=True)
+            self._accumulate_bucketed(name, value, times)
+            self.log(name, value.mean(), on_step=True, logger=True)
 
         return target
 
     def validation_step(self, batch, b_idx):
-        prior, data, interpolated, times = batch
+        prior, data, interpolated, times, _ = batch
 
         gen_batch = self._generate(prior, self.integrator.steps, self.sampling_strategy)
         stabilities = self._generate_stabilities(gen_batch)
@@ -1026,7 +1127,7 @@ class MolecularCFM(L.LightningModule):
         self.on_validation_epoch_end()
 
     def predict_step(self, batch, batch_idx):
-        prior, _, _, _ = batch
+        prior, _, _, _, _ = batch
         gen_batch = self._generate(prior, self.integrator.steps, self.sampling_strategy)
         gen_mols = self._generate_mols(gen_batch)
         return gen_mols
@@ -1058,7 +1159,7 @@ class MolecularCFM(L.LightningModule):
         return config
 
     def _distill_training_step(self, batch):
-        prior, data, interpolated, times = batch
+        prior, data, interpolated, times, _ = batch
 
         input_batch = prior
         cond_batch = None

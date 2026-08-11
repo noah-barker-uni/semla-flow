@@ -85,7 +85,7 @@ def draw_targets(mols, coupling, target, t, n_draws, coord_noise_std, kabsch_ali
     targets, states = [], []
     mask = None
     for _ in range(n_draws):
-        _, to_mols, interp_mols, times = interpolant.interpolate(list(mols))
+        _, to_mols, interp_mols, times, _ = interpolant.interpolate(list(mols))
 
         data = _batch_from_mols(to_mols)
         interpolated = _batch_from_mols(interp_mols)

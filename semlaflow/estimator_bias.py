@@ -77,7 +77,7 @@ def build_cost_matrices(mols, t, coord_noise_std, coupling="hungarian", kabsch_a
         fixed_time=t,
     )
 
-    _, to_mols, interp_mols, _ = interpolant.interpolate(list(mols))
+    _, to_mols, interp_mols, _, _ = interpolant.interpolate(list(mols))
 
     n_atoms = max(mol.seq_length for mol in to_mols)
     data = geometric_batch_to_dict(GeometricMolBatch.from_list(list(to_mols)), n_atoms)

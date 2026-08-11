@@ -154,7 +154,7 @@ def _transport_cost_for_arm(args, ckpt_path, vocab, n_batches=20, batch_size=64)
     costs = []
     for start in range(0, min(n_batches * batch_size, len(dataset)), batch_size):
         to_mols = [dataset[i] for i in range(start, min(start + batch_size, len(dataset)))]
-        from_mols, to_out, _, _ = interpolant.interpolate(to_mols)
+        from_mols, to_out, _, _, _ = interpolant.interpolate(to_mols)
         costs.append(coupling_transport_cost(from_mols, to_out))
 
     return (float(np.mean(costs)) if costs else None), f"{coupling}/kabsch={bool(kabsch)}"
