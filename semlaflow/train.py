@@ -340,7 +340,16 @@ def build_trainer(args):
     run_name = args.run_name if args.run_name is not None else f"{arm}_seed{args.seed}"
     print("Using precision '32'")
 
-    logger = WandbLogger(project=project_name, name=run_name, save_dir="wandb", log_model=True)
+    # group and tags must be passed at construction -- WandbLogger forwards **kwargs to wandb.init,
+    # and wandb's Run.group is a read-only property, so assigning it afterwards raises.
+    logger = WandbLogger(
+        project=project_name,
+        name=run_name,
+        save_dir="wandb",
+        log_model=True,
+        group=arm,
+        tags=[arm, f"seed{args.seed}", DEFAULT_RUN_SERIES],
+    )
 
     # The arm definition goes into the config as SEPARATE FIELDS rather than being baked into the
     # run name, and runs are grouped by arm. With group set, "mean +/- band per arm across seeds"
@@ -363,8 +372,6 @@ def build_trainer(args):
         },
         allow_val_change=True,
     )
-    logger.experiment.group = arm
-    logger.experiment.tags = tuple(logger.experiment.tags or ()) + (arm, f"seed{args.seed}", DEFAULT_RUN_SERIES)
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
