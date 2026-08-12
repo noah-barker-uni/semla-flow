@@ -381,25 +381,45 @@ Next, in priority order:
 
 ## Submitting runs on Isambard
 
-Batch scripts live at `/projects/b5bg/barkern.b5bg/sb_*.sh` (not in the repo — they hardcode
-cluster paths). The pattern that matters:
+Batch scripts and job outputs both live in `/projects/b5bg/barkern.b5bg/runs/` (not in the repo —
+they hardcode cluster paths). Everything from the pre-corrections work is archived in `runs_old/`.
+
+| Script | What it is |
+|---|---|
+| `smoke_qm9.slurm` | Gate. 1 epoch x 3 targets on QM9. Exits non-zero if any arm fails. |
+| `train_qm9.slurm` | One arm of the factorial on QM9. `COUPLING`/`TARGET`/`SEED` via `--export`. |
+| `smoke_geom-drugs.slurm` | Timing probe on GEOM-Drugs — steps_per_sec, not a finished epoch. |
+| `train_geom-drugs.slurm` | One arm on GEOM-Drugs, stock defaults (see below). |
+
+`.slurm` rather than a `sb_` prefix: the extension says what the file is without needing a key.
 
 ```bash
-# One gate job, then the real runs behind --dependency=afterok on it
-sbatch sb_smoke_qm9.sh                       # 1 epoch x 3 targets, must exit non-zero on failure
+cd /projects/b5bg/barkern.b5bg/runs
+SMOKE=$(sbatch --parsable smoke_qm9.slurm)     # gate first
 for COUPLING in none hungarian; do
   for TARGET in hard sinkhorn mcmc; do
-    sbatch --dependency=afterok:<smoke_id> --job-name="qm9_${COUPLING}_${TARGET}" \
-           --export=ALL,COUPLING=$COUPLING,TARGET=$TARGET sb_train_qm9.sh
+    sbatch --dependency=afterok:$SMOKE --job-name="qm9_${COUPLING}_${TARGET}" \
+           --export=ALL,COUPLING=$COUPLING,TARGET=$TARGET train_qm9.slurm
   done
 done
 ```
 
-Two traps, both hit already:
+**Parameters differ by dataset and this is easy to get wrong.** Upstream's README: *"The default
+arguments in the training script are for GEOM Drugs. To train on QM9 we use a `bond_loss_weight`
+of 0.5, 2000 `warm_up_steps` and usually 300 `epochs`."* So QM9 must override three arguments, and
+**GEOM-Drugs must override none of them** — 200 epochs, `bond_loss_weight` 1.0, `warm_up_steps`
+10000. Copying the QM9 flags onto a GEOM run is wrong in all three.
+
+Three traps, all hit already:
 
 - **A smoke job that loops over configs must track failures and `exit $FAILED`.** A bare loop
   exits with the status of the *last* command, so `afterok` fires even when an arm crashed — the
   gate is then worthless.
+- **Deploy before you submit.** A fix that is written, tested and pushed is still not running
+  until the cluster checkout is pulled. Six queued runs died on an `AttributeError` that had
+  already been fixed three commits earlier. Every job script now echoes
+  `RUNNING COMMIT: <sha> <subject>` as its first line and `train.py` records `git_revision` in
+  `wandb.config`, so a stale checkout announces itself.
 - **The login node reaps long-running and memory-heavy processes.** Detached `nohup`/`setsid`
   downloads were killed three times with an empty log, and loading GEOM's 915 MB `train.smol`
   was OOM-killed (exit 137). Long downloads need a kept-alive foreground SSH session with a
