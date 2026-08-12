@@ -1,4 +1,5 @@
 import argparse
+import subprocess
 from functools import partial
 from pathlib import Path
 
@@ -330,6 +331,28 @@ def build_dm(args, vocab):
     return dm
 
 
+def _git_revision():
+    """Short SHA of the checkout being run, or None outside a git tree.
+
+    Logged into wandb.config because a job that silently executes a stale checkout looks exactly
+    like one that does not -- which is how a fix that was written, tested and pushed still managed
+    to crash six queued runs.
+    """
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
 def build_trainer(args):
     epochs = 1 if args.trial_run else args.epochs
     log_steps = 1 if args.trial_run else 50
@@ -369,6 +392,7 @@ def build_trainer(args):
             "target_mcmc_knn_k": args.target_mcmc_knn_k,
             "arm": arm,
             "run_series": DEFAULT_RUN_SERIES,
+            "git_revision": _git_revision(),
         },
         allow_val_change=True,
     )
