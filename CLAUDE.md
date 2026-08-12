@@ -384,24 +384,25 @@ Next, in priority order:
 Batch scripts and job outputs both live in `/projects/b5bg/barkern.b5bg/runs/` (not in the repo —
 they hardcode cluster paths). Everything from the pre-corrections work is archived in `runs_old/`.
 
-| Script | What it is |
-|---|---|
-| `smoke_qm9.slurm` | Gate. 1 epoch x 3 targets on QM9. Exits non-zero if any arm fails. |
-| `train_qm9.slurm` | One arm of the factorial on QM9. `COUPLING`/`TARGET`/`SEED` via `--export`. |
-| `smoke_geom-drugs.slurm` | Timing probe on GEOM-Drugs — steps_per_sec, not a finished epoch. |
-| `train_geom-drugs.slurm` | One arm on GEOM-Drugs, stock defaults (see below). |
+```
+runs/
+  smoke_qm9.sh              Gate. 1 epoch x 3 targets on QM9; exits non-zero if any arm fails.
+  smoke_geom-drugs.sh       Timing probe -- steps_per_sec and memory, not a finished epoch.
+  qm9/                      One self-contained script per arm, named <coupling>_<target>.sh
+    none_hard.sh  none_sinkhorn.sh  none_mcmc.sh
+    hungarian_hard.sh  hungarian_sinkhorn.sh  hungarian_mcmc.sh
+  geom-drugs/               Same six names; different parameters (see below)
+```
 
-`.slurm` rather than a `sb_` prefix: the extension says what the file is without needing a key.
+One script per arm with the settings baked in, rather than one parametrised script driven by
+`--export`: the arm then exists on disk rather than only in the submit command, and
+`sbatch runs/qm9/hungarian_sinkhorn.sh` is the whole invocation. Per-dataset subdirectories so the
+filename can be just coupling and target.
 
 ```bash
 cd /projects/b5bg/barkern.b5bg/runs
-SMOKE=$(sbatch --parsable smoke_qm9.slurm)     # gate first
-for COUPLING in none hungarian; do
-  for TARGET in hard sinkhorn mcmc; do
-    sbatch --dependency=afterok:$SMOKE --job-name="qm9_${COUPLING}_${TARGET}" \
-           --export=ALL,COUPLING=$COUPLING,TARGET=$TARGET train_qm9.slurm
-  done
-done
+SMOKE=$(sbatch --parsable smoke_qm9.sh)                       # gate first
+sbatch --dependency=afterok:$SMOKE qm9/hungarian_sinkhorn.sh  # arm starts only if the gate passes
 ```
 
 **Parameters differ by dataset and this is easy to get wrong.** Upstream's README: *"The default
