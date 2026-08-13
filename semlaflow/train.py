@@ -50,7 +50,13 @@ DEFAULT_NUM_INFERENCE_STEPS = 100
 DEFAULT_CAT_SAMPLING_NOISE_LEVEL = 1
 DEFAULT_COORD_NOISE_STD_DEV = 0.2
 DEFAULT_TYPE_DIST_TEMP = 1.0
-DEFAULT_TIME_ALPHA = 2.0
+# Uniform t. Times are drawn from Beta(time_alpha, time_beta), so (1, 1) is exactly Uniform(0, 1).
+# Upstream's Beta(2, 1) has density proportional to t, putting only ~25% of samples below t=0.5
+# against uniform's 50% -- it halves the training signal in the low-t region, which is precisely
+# where a soft target differs most from the hard one and where the averaged flow is most curved.
+# Cao et al. (arXiv 2507.09785) go the other way for the same reason, sampling t ~ exp(-1.2t) to
+# concentrate on t < 0.5. Held fixed across every arm.
+DEFAULT_TIME_ALPHA = 1.0
 DEFAULT_TIME_BETA = 1.0
 DEFAULT_OPTIMAL_TRANSPORT = "none"
 DEFAULT_COUPLING = "hungarian"
