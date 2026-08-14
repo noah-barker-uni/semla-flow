@@ -470,3 +470,67 @@ class SoftCrossEntropyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoordinatesOnlyAblationTests(unittest.TestCase):
+    """blend_categoricals=False: posterior-mean coordinates, exact categorical labels.
+
+    This is the configuration that matches Cao et al.'s SO(3)-Averaged Flow, where the 2D graph is
+    given as conditioning so the averaging only ever touches coordinates.
+    """
+
+    def test_only_coordinates_are_blended(self):
+        data, interpolated, times, _ = _fixture(t=0.3, seed=30)
+
+        target, _ = permutation_target(
+            data, interpolated, times, "sinkhorn", sinkhorn_iters=50, blend_categoricals=False
+        )
+
+        self.assertFalse(torch.equal(target["coords"], data["coords"]))
+        self.assertTrue(torch.equal(target["atomics"], data["atomics"]))
+        self.assertTrue(torch.equal(target["bonds"], data["bonds"]))
+        self.assertTrue(torch.equal(target["charges"], data["charges"]))
+
+    def test_coordinates_match_the_blended_run(self):
+        """The coordinate channel must be identical either way -- only the labels differ."""
+
+        data, interpolated, times, _ = _fixture(t=0.3, seed=31)
+
+        blended, _ = permutation_target(
+            data, interpolated, times, "sinkhorn", sinkhorn_iters=50, blend_categoricals=True
+        )
+        coords_only, _ = permutation_target(
+            data, interpolated, times, "sinkhorn", sinkhorn_iters=50, blend_categoricals=False
+        )
+
+        self.assertTrue(torch.equal(blended["coords"], coords_only["coords"]))
+        self.assertFalse(torch.equal(blended["atomics"], coords_only["atomics"]))
+
+    def test_categorical_labels_stay_one_hot(self):
+        """The whole point: labels are exact, so argmax recovers the true class."""
+
+        data, interpolated, times, _ = _fixture(t=0.05, seed=32)
+
+        target, _ = permutation_target(
+            data, interpolated, times, "sinkhorn", sinkhorn_iters=50, blend_categoricals=False
+        )
+
+        mask = data["mask"]
+        for b in range(mask.size(0)):
+            n_b = int(mask[b].sum().item())
+            rows = target["atomics"][b, :n_b]
+            self.assertTrue(((rows == 0) | (rows == 1)).all().item())
+            self.assertTrue((rows.sum(dim=-1) == 1).all().item())
+
+    def test_apply_plan_identity_is_a_noop_either_way(self):
+        data, _, _, _ = _fixture(sizes=(5, 5), seed=33)
+        eye = torch.eye(5).expand(2, 5, 5)
+
+        for blend in (True, False):
+            target = apply_plan(eye, data, blend_categoricals=blend)
+            np.testing.assert_almost_equal(
+                target["coords"].numpy(), data["coords"].numpy(), decimal=6, err_msg=str(blend)
+            )
+            np.testing.assert_almost_equal(
+                target["atomics"].numpy(), data["atomics"].numpy(), decimal=6, err_msg=str(blend)
+            )

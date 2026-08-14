@@ -76,6 +76,7 @@ def permutation_target(
     mcmc_iters: int = 100,
     mcmc_proposal: str = "knn",
     mcmc_knn_k: int = 8,
+    blend_categoricals: bool = True,
     eps_override: Optional[_T] = None,
 ) -> tuple[_BatchT, dict[str, _T]]:
     """Build the regression target the model is trained against, given the current state x_t.
@@ -119,6 +120,8 @@ def permutation_target(
         mcmc_iters (int): Metropolis iterations, target="mcmc" only.
         mcmc_proposal (str): "uniform" or "knn", target="mcmc" only.
         mcmc_knn_k (int): Neighbours the knn proposal may swap with, target="mcmc" only.
+        blend_categoricals (bool): Apply the plan to atomics/bonds/charges too. False gives the
+            coordinates-only ablation; see apply_plan.
         eps_override (Optional[_T]): Shape [B]. Bypasses the schedule entirely. Exists so tests can
             drive the temperature directly instead of inverting the schedule; not used in training.
 
@@ -202,7 +205,7 @@ def permutation_target(
     eye = torch.eye(n, dtype=plan.dtype, device=plan.device).expand(batch_size, n, n)
     plan = torch.where(soft_ok.view(-1, 1, 1), plan, eye)
 
-    target_batch = apply_plan(plan, data)
+    target_batch = apply_plan(plan, data, blend_categoricals=blend_categoricals)
     diagnostics = _target_diagnostics(
         target_batch, data, interpolated, plan, times, eps, soft_ok, row_dev, col_dev, mcmc_stats,
         target_name=target,
@@ -210,24 +213,43 @@ def permutation_target(
     return target_batch, diagnostics
 
 
-def apply_plan(plan: _T, data: _BatchT) -> _BatchT:
-    """Apply a row-stochastic plan to every channel of a data batch jointly.
+def apply_plan(plan: _T, data: _BatchT, blend_categoricals: bool = True) -> _BatchT:
+    """Apply a row-stochastic plan to a data batch.
 
     A permutation acts on coordinates, atom types, bond types and charges together, so a soft
-    permutation must too. Single-index channels are exact functions of the row marginals; the
-    pairwise bond channel additionally needs pairwise marginals, and P B P^T is the mean-field
+    permutation normally must too. Single-index channels are exact functions of the row marginals;
+    the pairwise bond channel additionally needs pairwise marginals, and P B P^T is the mean-field
     approximation to those -- except on the diagonal, where the exact marginal is a point mass and
     is restored below.
+
+    blend_categoricals=False blends ONLY the coordinates and leaves atom types, bonds and charges
+    at their exact values. This is the coordinates-only ablation, and it is the configuration that
+    matches Cao et al.'s SO(3)-Averaged Flow: there the 2D graph is given as conditioning, so their
+    averaging only ever touches coordinates and no categorical channel exists to smear. It stays
+    coherent because x_t slot i was built from data atom i (the coupling permutes the PRIOR), so
+    atom i's exact type IS the correct label for slot i -- only the coordinate label is replaced by
+    its posterior mean.
 
     Args:
         plan (_T): Row-stochastic plan, shape [B, N, N].
         data (_BatchT): Batch to permute. Its mask is passed through unchanged.
+        blend_categoricals (bool): Apply the plan to atomics/bonds/charges as well as coordinates.
 
     Returns:
-        _BatchT: Soft-permuted batch. Discrete channels become soft labels.
+        _BatchT: Permuted batch. Discrete channels become soft labels only if blend_categoricals.
     """
 
     coords = plan @ data["coords"]
+
+    if not blend_categoricals:
+        return {
+            "coords": coords,
+            "atomics": data["atomics"],
+            "bonds": data["bonds"],
+            "charges": data["charges"],
+            "mask": data["mask"],
+        }
+
     atomics = plan @ data["atomics"]
     charges = plan @ data["charges"].to(plan.dtype)
 
@@ -716,6 +738,7 @@ class MolecularCFM(L.LightningModule):
         target_mcmc_iters: int = 100,
         target_mcmc_proposal: str = "knn",
         target_mcmc_knn_k: int = 8,
+        target_blend_categoricals: bool = True,
         **kwargs
     ):
         super().__init__()
@@ -743,6 +766,17 @@ class MolecularCFM(L.LightningModule):
         # soft target would only apply to half of it
         if distill and target != "hard":
             raise ValueError("Distilled training is only supported with target='hard'.")
+
+        # mcmc applies a hard PERMUTATION, so not permuting the categoricals alongside the
+        # coordinates would put atom pi(i)'s position next to atom i's type -- an incoherent
+        # labelling rather than an ablation. The coordinates-only variant only means something for
+        # a soft plan, where the coordinate label is being replaced by its posterior mean while the
+        # exact type label for that slot is retained.
+        if target == "mcmc" and not target_blend_categoricals:
+            raise ValueError(
+                "target_blend_categoricals=False is only meaningful for target='sinkhorn'; for "
+                "'mcmc' it would decouple each slot's coordinates from its atom type."
+            )
 
         if lr_schedule == "one-cycle" and warm_up_steps is not None:
             print("Note: warm_up_steps is currently ignored if schedule is one-cycle")
@@ -772,6 +806,7 @@ class MolecularCFM(L.LightningModule):
         self.target_mcmc_iters = target_mcmc_iters
         self.target_mcmc_proposal = target_mcmc_proposal
         self.target_mcmc_knn_k = target_mcmc_knn_k
+        self.target_blend_categoricals = target_blend_categoricals
 
         # persistent=False is load-bearing: these must never enter state_dict, or a checkpoint
         # written by a soft arm stops loading in an arm that does not define them
@@ -814,6 +849,7 @@ class MolecularCFM(L.LightningModule):
             "target_mcmc_iters": target_mcmc_iters,
             "target_mcmc_proposal": target_mcmc_proposal,
             "target_mcmc_knn_k": target_mcmc_knn_k,
+            "target_blend_categoricals": target_blend_categoricals,
             **gen.hparams,
             **integrator.hparams,
             **kwargs
@@ -1073,6 +1109,7 @@ class MolecularCFM(L.LightningModule):
             mcmc_iters=self.target_mcmc_iters,
             mcmc_proposal=self.target_mcmc_proposal,
             mcmc_knn_k=self.target_mcmc_knn_k,
+            blend_categoricals=self.target_blend_categoricals,
         )
 
         for name, value in diagnostics.items():
@@ -1354,7 +1391,7 @@ class MolecularCFM(L.LightningModule):
         summing over the class axis, which matters for bonds at [B*N*N, E].
         """
 
-        return self.target == "sinkhorn"
+        return self.target == "sinkhorn" and self.target_blend_categoricals
 
     def _ce_target(self, dist, flatten_end):
         """Flatten a one-hot/soft target into whatever F.cross_entropy should receive.

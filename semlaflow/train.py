@@ -66,6 +66,7 @@ DEFAULT_TARGET_SINKHORN_ITERS = 100
 DEFAULT_TARGET_MCMC_ITERS = 100
 DEFAULT_TARGET_MCMC_PROPOSAL = "knn"
 DEFAULT_TARGET_MCMC_KNN_K = 8
+DEFAULT_TARGET_BLEND_CATEGORICALS = True
 
 # Bumped so the corrected runs land in their own wandb project and their own checkpoint tree,
 # separate from the pre-corrections experiments. Override with --wandb_project / --checkpoint_dir.
@@ -213,6 +214,7 @@ def build_model(args, dm, vocab):
         target_mcmc_iters=args.target_mcmc_iters,
         target_mcmc_proposal=args.target_mcmc_proposal,
         target_mcmc_knn_k=args.target_mcmc_knn_k,
+        target_blend_categoricals=args.target_blend_categoricals,
         **hparams,
     )
     return fm_model
@@ -366,6 +368,8 @@ def build_trainer(args):
 
     project_name = args.wandb_project or f"{util.PROJECT_PREFIX}-{args.dataset}-{DEFAULT_RUN_SERIES}"
     arm = f"{args.coupling}_{args.target}"
+    if not args.target_blend_categoricals:
+        arm += "-hardcat"
     run_name = args.run_name if args.run_name is not None else f"{arm}_seed{args.seed}"
     print("Using precision '32'")
 
@@ -396,6 +400,7 @@ def build_trainer(args):
             "target_mcmc_iters": args.target_mcmc_iters,
             "target_mcmc_proposal": args.target_mcmc_proposal,
             "target_mcmc_knn_k": args.target_mcmc_knn_k,
+            "target_blend_categoricals": args.target_blend_categoricals,
             "arm": arm,
             "run_series": DEFAULT_RUN_SERIES,
             "git_revision": _git_revision(),
@@ -544,6 +549,13 @@ if __name__ == "__main__":
         "--target_mcmc_proposal", type=str, default=DEFAULT_TARGET_MCMC_PROPOSAL, choices=["uniform", "knn"]
     )
     parser.add_argument("--target_mcmc_knn_k", type=int, default=DEFAULT_TARGET_MCMC_KNN_K)
+    parser.add_argument(
+        "--target_blend_categoricals",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_TARGET_BLEND_CATEGORICALS,
+        help="--no-target_blend_categoricals gives the coordinates-only ablation: the plan is "
+        "applied to coordinates but atom types, bonds and charges keep their exact labels",
+    )
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--checkpoint_dir", type=str, default=DEFAULT_CHECKPOINT_DIR)
 
