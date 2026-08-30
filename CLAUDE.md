@@ -280,26 +280,35 @@ torch-scatter. Semla is pure PyTorch with dense attention. This is why ARM works
 ### Slurm
 
 - Account: `brics.b5bg` (NOT `b5bg`) — GPU allocation, use for training only
-- CPU allocation `b35bs.3.isambard` / `b35bs.macs3.isambard` is currently unused. **GFN2-xTB
-  evaluation is CPU work and embarrassingly parallel — run it there** and keep b5bg GPU hours
-  for training: `python -m semlaflow.xtb_eval --sdf_path ... --n_workers 64`.
+- CPU allocation `b35bs.3.isambard` / `b35bs.macs3.isambard` is unused, and GFN2-xTB evaluation is
+  CPU work — but **do not run xtb on Isambard**, see below. It runs on the Mac instead. At
+  `--n_workers 8` a 5000-molecule QM9 set takes ~2-3 min for well-formed geometries.
 
-### Getting xtb onto aarch64
+### xtb on aarch64: works on the Mac, silently WRONG on Isambard
 
-Non-obvious, because the usual routes do not exist: grimme-lab publishes **no aarch64 binary**
-(only linux-x86_64 and windows), and there is **no linux-aarch64 wheel for `tblite`** either. The
-PyPI `xtb` package fails to build. What does work is conda-forge, which builds xtb 6.7.1 for both
-`linux-aarch64` and `osx-arm64`. Isambard has no conda module, so use a standalone micromamba (a
-single static binary, available for linux-aarch64) or a bare conda prefix:
+Getting a binary at all is non-obvious, because the usual routes do not exist: grimme-lab publishes
+**no aarch64 binary** (only linux-x86_64 and windows), and there is **no linux-aarch64 wheel for
+`tblite`** either. The PyPI `xtb` package fails to build. conda-forge builds xtb 6.7.1 for both
+`linux-aarch64` and `osx-arm64`, and extracting the `.conda` by hand does NOT work — the binary
+needs its transitive conda deps (`libmctc-lib` and friends), so let the solver do it.
+
+**The osx-arm64 build is correct; every linux-aarch64 build tried is not.** The conda-forge
+`linux-aarch64` xtb returns *positive* single-point energies (water: +0.0785 Eh, against
+-0.0074518 Eh on the Mac), and two other aarch64 builds segfault. It does not error — it prints
+plausible-looking output with wrong numbers, which is the worst possible failure mode for a
+primary metric. So `semlaflow/util/xtb.py:validate_xtb_binary()` runs a two-part guard before any
+evaluation: relax a distorted geometry (must *lower* the energy) and re-relax its own minimum (must
+give ~0). A good run announces itself, e.g. `xtb 6.7.1 validated: distorted geometry relaxed by
+26.5451 kcal/mol, its own minimum by 0.000000`. **Never disable this guard.**
+
+Consequence: generation happens on Isambard, xTB scoring happens locally on the Mac against the
+SDFs pulled down, and the resulting `xtb/*.json` are pushed back up. `SEMLAFLOW_XTB_BINARY` (or
+`--xtb_binary`) points at the prefix so it need not be merged into any training venv:
 
 ```bash
-conda create -p /projects/b5bg/barkern.b5bg/envs/xtb -c conda-forge xtb
-export SEMLAFLOW_XTB_BINARY=/projects/b5bg/barkern.b5bg/envs/xtb/bin/xtb
+conda create -p <prefix>/xtb -c conda-forge xtb      # osx-arm64
+export SEMLAFLOW_XTB_BINARY=<prefix>/xtb/bin/xtb
 ```
-
-`SEMLAFLOW_XTB_BINARY` (or `--xtb_binary`) exists so the xtb prefix does not have to be merged
-into the training venv. Extracting the `.conda` package by hand does NOT work — the binary needs
-its transitive conda deps (`libmctc-lib` and friends), so let the solver do it.
 - Partition: `workq`
 - Accounting: 1 node = 4 GH200, so 1 NHR = 4 GPU-hours; single-GPU job = 0.25 NHR/hour
 - Cluster is heavily loaded; interactive `--pty` jobs get stuck on `Reason: Priority`.
@@ -330,6 +339,27 @@ python -m semlaflow.train --data_path ... <args>
 - Checkpoints: `checkpoints_v2/<run_name>/` for the corrected runs. The pre-corrections runs are
   preserved at `checkpoints_v1_exploratory/` — keep, do not cite (see "All existing Sinkhorn/MCMC
   numbers are uninterpretable").
+- Results: `/projects/b5bg/barkern.b5bg/results/` — `generated/` (`predict.py`), `analysis/`
+  (`analyse_generated.py`), `xtb/` (`xtb_eval.py`, produced on the **Mac**, see below),
+  `diagnostics/` (`target_variance.py`), and `summary.{json,md}` from `collect_results.py`.
+  Mirrored locally at `output/results/`, which is gitignored — the summaries live on disk only.
+
+### SSH: use the Clifton host alias, not a hostname
+
+`ssh barkern.b5bg@ai.login.isambard.ac.uk` fails with `Permission denied (publickey)` and
+`ai-p2.access.isambard.ac.uk` does not resolve from off-cluster at all. Neither is the way in.
+`~/.ssh/config` includes a Clifton-managed `config_clifton` defining **`b5bg.aip2.isambard`**,
+which sets the user, the short-lived certificate in `~/Library/Caches/clifton/`, and a ProxyJump
+through the login node. So the whole invocation is:
+
+```bash
+ssh b5bg.aip2.isambard
+rsync -av output/results/xtb/ b5bg.aip2.isambard:/projects/b5bg/barkern.b5bg/results/xtb/
+```
+
+The certificate expires, and an expired one fails with the same `Permission denied (publickey)` as
+a wrong hostname — re-run the Clifton login rather than debugging the host. The other allocations
+have their own aliases in the same file (`b35bs.3.isambard`, `b35bs.macs3.isambard`).
 
 ## Plan / status
 
@@ -343,6 +373,49 @@ the `equinv-<dataset>-v2` wandb project and `checkpoints_v2/`, so nothing mixes 
 experiments. Override with `--wandb_project` / `--checkpoint_dir`. Run names are
 `<coupling>_<target>_seed<seed>`, the arm is also in `wandb.config` as separate fields, and runs
 are grouped by arm so "mean +/- band across seeds" is two clicks rather than a CSV export.
+
+### QM9 results, 1 seed, 5000 molecules per arm — the soft target FAILS
+
+`results/summary.md`. Baseline `none_hard`; ΔE_relax kcal/mol, lengths Angstrom, angles degrees.
+
+| arm | validity | dE_relax med/mean | bond len dev | bond angle dev | xtb RMSD |
+|---|---|---|---|---|---|
+| hungarian_hard | 0.9924 | **9.29 / 13.5** | **0.0234** | **1.59** | **0.094** |
+| none_hard | 0.9938 | 10.01 / 15.2 | 0.0246 | 1.71 | 0.109 |
+| none_mcmc | 0.9672 | 14.28 / 53.3 | 0.0294 | 1.86 | 0.139 |
+| none_sinkhorn | **0.0000** | — | — | — | — |
+| none_sinkhorn-hardcat | 0.9496 | **768.7 / 2803** | **0.252** | **16.4** | **0.808** |
+
+Read this before designing anything further:
+
+- **Both channels of the soft target fail independently.** Soft *categoricals* make the bond graph
+  unconstructible (0% valid). Soft *coordinates* leave a plausible graph wrapped around garbage
+  geometry — that is the `-hardcat` arm, which is 95% valid but 75x worse in dE_relax, Cliff's
+  delta 0.995 against the baseline. **Validity did not catch this and neither did Rg** (2.291 vs
+  2.310, `collapsed_fraction` 0). It took GFN2-xTB. Do not judge an arm on validity alone.
+- **Not geometric collapse.** The earlier prediction — soft target ⇒ every atom at the centroid ⇒
+  visibly collapsed molecules — is **wrong** as stated for the generated samples. `none_sinkhorn`'s
+  outputs have Rg 2.08 A and nearest-neighbour distance 1.126 A, both normal. The damage is in the
+  bond graph and in fine geometry, not in the overall size of the molecule.
+- **The training target does collapse, and that is arithmetic rather than a bug.** From
+  `diagnostics/target_collapse.json`, `||P x1|| / ||x1||` under `sinkhorn` is 0.043 at t=0.05
+  (17.3 effective atoms averaged), 0.622 at t=0.5, 0.994 at t=0.95. Near-uniform P makes `P @ x1`
+  the row-mean of x1 = the centroid = the ORIGIN for zero-COM molecules, so the model is regressed
+  toward zero over the whole low-t half of every trajectory.
+- **The conceptual gap this exposes.** The Bayes-optimal x1-target is `E[x1 | x_t]` under the joint
+  (x0, x1) law. Sinkhorn instead averages over permutations of the *specific* x1 in the batch,
+  conditioning on information the model does not have. That moves the target away from x1 without
+  moving it toward `E[x1 | x_t]` — it moves it toward that one molecule's centroid. Bregman
+  linearity licenses substituting a conditional mean, but only over the correct conditioning set.
+  This is the thing to think hardest about before spending more GPU hours on the target axis.
+- **Against the pre-committed falsification criterion** ("if hard ~= sinkhorn ~= mcmc, the
+  hypothesis is dead") the outcome is stronger: soft is dramatically worse, MCMC mildly worse
+  (delta 0.13-0.31). The only thing that helps is the Hungarian **coupling** — hungarian_hard beats
+  none_hard on all five geometry metrics, consistently but with small effect (delta -0.07 to -0.11,
+  dE_relax -0.7, CI [-1.09, -0.41]).
+- **One seed**, so these compare trained models rather than methods. The hardcat and sinkhorn
+  effects are far too large for seed noise; the hungarian-vs-none effect is not, and needs the
+  other two seeds before it is claimed.
 
 Next, in priority order:
 
