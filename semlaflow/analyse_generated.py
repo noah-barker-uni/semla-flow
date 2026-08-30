@@ -94,8 +94,22 @@ def graph_metrics(sdf_path: Path, n_generated: int) -> dict:
 
     from rdkit import Chem
 
-    if not Path(sdf_path).exists() or n_generated == 0:
+    sdf_path = Path(sdf_path)
+    if not sdf_path.exists() or n_generated == 0:
         return {}
+
+    # An EMPTY sdf means predict.py could not build a single molecule -- zero valid, which is a
+    # result rather than an error. RDKit raises OSError on a zero-byte file instead of yielding
+    # nothing, so it has to be handled before the supplier is constructed.
+    if sdf_path.stat().st_size == 0:
+        return {
+            "n_in_sdf": 0,
+            "rdkit_constructible_fraction": 0.0,
+            "validity": 0.0,
+            "fc_validity": 0.0,
+            "molecule_stability": 0.0,
+            "atom_stability": None,
+        }
 
     supplier = Chem.SDMolSupplier(str(sdf_path), removeHs=False, sanitize=False)
     mols = [mol for mol in supplier if mol is not None]
