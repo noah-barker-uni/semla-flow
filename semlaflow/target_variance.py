@@ -31,6 +31,7 @@ construction alone, so it can be run before committing GPU hours to an arm.
 """
 
 import argparse
+import json
 from functools import partial
 from pathlib import Path
 
@@ -82,8 +83,9 @@ def draw_targets(mols, coupling, target, t, n_draws, coord_noise_std, kabsch_ali
         fixed_time=t,
     )
 
-    targets, states = [], []
+    targets, states, diagnostics = [], [], []
     mask = None
+    data_coords = None
     for _ in range(n_draws):
         _, to_mols, interp_mols, times, _ = interpolant.interpolate(list(mols))
 
@@ -91,22 +93,30 @@ def draw_targets(mols, coupling, target, t, n_draws, coord_noise_std, kabsch_ali
         interpolated = _batch_from_mols(interp_mols)
         times_t = torch.stack(list(times)).float()
 
-        target_batch, _ = permutation_target(
+        target_batch, diag = permutation_target(
             data, interpolated, times_t, target, noise_std=coord_noise_std, **target_kwargs
         )
         targets.append(target_batch["coords"])
         states.append(interpolated["coords"])
+        diagnostics.append(diag)
         mask = data["mask"]
+        data_coords = data["coords"]
 
-    return torch.stack(targets), torch.stack(states), mask
+    return torch.stack(targets), torch.stack(states), mask, data_coords, diagnostics
 
 
-def variance_summary(targets, states, mask):
-    """Per-atom variance over draws, averaged over real atoms.
+def variance_summary(targets, states, mask, data_coords=None, diagnostics=None):
+    """Per-atom variance over draws, plus the target-collapse curve.
+
+    The collapse quantities are the mechanism behind the soft-target failure and are the reason
+    this reports more than variance. As the plan goes uniform, P @ x1 becomes the row-mean of x1,
+    which is the molecular centroid -- and QM9 molecules are zero-COM, so that centroid is the
+    ORIGIN. norm_ratio = ||target|| / ||x1|| therefore falls to ~0 at low t: the regression label
+    is all zeros. eff_atoms = 1 / sum_j P_ij^2 says how many atoms are being averaged to get there.
 
     Returns:
-        dict: target_variance and displacement_variance, both summed over xyz so they are in the
-            same units as a squared coordinate.
+        dict: target_variance, displacement_variance (both summed over xyz, so squared-coordinate
+            units), plus target_norm, data_norm, norm_ratio and eff_atoms where available.
     """
 
     mask_f = mask.to(targets.dtype).unsqueeze(-1)
@@ -116,10 +126,32 @@ def variance_summary(targets, states, mask):
     displacement = targets - states
     displacement_var = displacement.var(dim=0, unbiased=False).sum(dim=-1)
 
-    return {
+    summary = {
         "target_variance": float((target_var * mask_f.squeeze(-1)).sum().item() / n_real),
         "displacement_variance": float((displacement_var * mask_f.squeeze(-1)).sum().item() / n_real),
     }
+
+    # Mean per-atom distance from the origin, for the target and for x1 itself
+    def _norm(coords):
+        per_atom = (coords * mask_f).pow(2).sum(dim=-1).sqrt()
+        return float(per_atom.sum().item() / n_real)
+
+    summary["target_norm"] = float(np.mean([_norm(t) for t in targets]))
+    if data_coords is not None:
+        summary["data_norm"] = _norm(data_coords)
+        summary["norm_ratio"] = (
+            summary["target_norm"] / summary["data_norm"] if summary["data_norm"] > 0 else None
+        )
+
+    if diagnostics:
+        sums = [d["sinkhorn/sum_p_squared"].mean().item() for d in diagnostics if "sinkhorn/sum_p_squared" in d]
+        ents = [d["sinkhorn/plan_entropy"].mean().item() for d in diagnostics if "sinkhorn/plan_entropy" in d]
+        if sums:
+            summary["eff_atoms"] = float(np.mean([1.0 / s for s in sums]))
+        if ents:
+            summary["plan_entropy"] = float(np.mean(ents))
+
+    return summary
 
 
 def run(mols, args):
@@ -128,7 +160,7 @@ def run(mols, args):
         for target in args.targets:
             for t in args.times:
                 torch.manual_seed(args.seed)
-                targets, states, mask = draw_targets(
+                targets, states, mask, data_coords, diags = draw_targets(
                     mols,
                     coupling,
                     target,
@@ -138,26 +170,40 @@ def run(mols, args):
                     sinkhorn_iters=args.target_sinkhorn_iters,
                     mcmc_iters=args.target_mcmc_iters,
                 )
-                summary = variance_summary(targets, states, mask)
+                summary = variance_summary(targets, states, mask, data_coords, diags)
                 rows.append({"coupling": coupling, "target": target, "t": t, **summary})
 
     return rows
 
 
 def print_rows(rows):
+    def fmt(value, spec=">10.4f"):
+        return format(value, spec) if isinstance(value, (int, float)) else f"{'n/a':>10}"
+
     print()
-    print(f"{'coupling':<12}{'target':<10}{'t':>6}{'target var':>14}{'displacement var':>20}")
-    print("-" * 62)
+    header = (
+        f"{'coupling':<11}{'target':<10}{'t':>5}{'tgt var':>10}{'disp var':>10}"
+        f"{'||tgt||':>10}{'||x1||':>10}{'ratio':>10}{'eff atoms':>10}{'plan H':>10}"
+    )
+    print(header)
+    print("-" * len(header))
     for row in rows:
         print(
-            f"{row['coupling']:<12}{row['target']:<10}{row['t']:>6.2f}"
-            f"{row['target_variance']:>14.5f}{row['displacement_variance']:>20.5f}"
+            f"{row['coupling']:<11}{row['target']:<10}{row['t']:>5.2f}"
+            f"{fmt(row.get('target_variance'))}{fmt(row.get('displacement_variance'))}"
+            f"{fmt(row.get('target_norm'))}{fmt(row.get('data_norm'))}{fmt(row.get('norm_ratio'))}"
+            f"{fmt(row.get('eff_atoms'))}{fmt(row.get('plan_entropy'))}"
         )
 
     print()
-    print("target var is 0 for target=hard by construction -- the coupling permutes the PRIOR, so")
-    print("the hard target is x1 whatever x0 was drawn. displacement var is the comparable column:")
-    print("lower means the target moves less with the noise draw, ie. less gradient noise.")
+    print("tgt var is 0 for target=hard by construction -- the coupling permutes the PRIOR, so the")
+    print("hard target is x1 whatever x0 was drawn. disp var is the comparable column: lower means")
+    print("the target moves less with the noise draw, ie. less gradient noise.")
+    print()
+    print("ratio = ||target|| / ||x1||. THE COLLAPSE: as the plan goes uniform, P @ x1 becomes the")
+    print("row-mean of x1 = the molecular centroid, and QM9 molecules are zero-COM, so that is the")
+    print("ORIGIN. ratio -> 0 at low t means the regression label is all zeros. eff atoms is how")
+    print("many atoms are averaged to get there (1 = a single atom, n = the whole molecule).")
 
 
 def main(args):
@@ -175,7 +221,18 @@ def main(args):
     mols = [dataset[i] for i in range(len(dataset))]
 
     print(f"Measuring target variance over {args.n_draws} noise draws for {len(mols)} molecules")
-    print_rows(run(mols, args))
+    rows = run(mols, args)
+    print_rows(rows)
+
+    if args.save_path is not None:
+        save_path = Path(args.save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path.write_text(
+            json.dumps(
+                {"n_molecules": len(mols), "n_draws": args.n_draws, "rows": rows}, indent=2
+            )
+        )
+        print(f"\nWrote {save_path}")
 
 
 if __name__ == "__main__":
@@ -193,6 +250,7 @@ if __name__ == "__main__":
     parser.add_argument("--target_sinkhorn_iters", type=int, default=100)
     parser.add_argument("--target_mcmc_iters", type=int, default=100)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--save_path", type=str, default=None)
 
     args = parser.parse_args()
     main(args)
