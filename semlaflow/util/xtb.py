@@ -51,6 +51,10 @@ DEFAULT_TIMEOUT_SECONDS = 300
 
 BOHR_TO_ANGSTROM = 0.529177210903
 
+# A correct optimiser cannot move its own minimum. Generous, since the point is to catch builds
+# that are wrong by tens of kcal/mol, not to police convergence thresholds.
+VALIDATION_IDEMPOTENCY_TOL = 0.5
+
 # " total energy gain   :        -0.0074518 Eh       -4.6761 kcal/mol"
 _ENERGY_GAIN_RE = re.compile(
     r"total energy gain\s*:\s*(?P<hartree>[-\d.Ee+]+)\s*Eh\s+(?P<kcal>[-\d.Ee+]+)\s*kcal/mol"
@@ -91,6 +95,65 @@ def xtb_version(binary: Optional[str] = None) -> Optional[str]:
 
     match = re.search(r"xtb version\s+(\S+)", proc.stdout + proc.stderr)
     return match.group(1) if match else None
+
+
+def validate_xtb_binary(binary: Optional[str] = None, timeout: int = 120) -> tuple[bool, str]:
+    """Known-answer check that the xtb binary produces physically sane results.
+
+    This exists because a bad build fails SILENTLY. The conda-forge linux-aarch64 xtb 6.7.1 build
+    returns exit 0, prints no warning, and reports the optimiser RAISING the energy -- water going
+    UP 49 kcal/mol while moving 0.25 A, where the correct answer is DOWN 4.7 kcal/mol over 0.04 A.
+    Every dE_relax computed with it would have been plausible-looking garbage.
+
+    The check is pure physics and needs no reference value: relaxing a distorted geometry must
+    LOWER the energy, so dE_relax (which is the negated energy gain) must be positive. A second
+    relaxation from the resulting minimum must then cost nothing.
+
+    Returns:
+        tuple[bool, str]: (ok, human-readable explanation).
+    """
+
+    from rdkit import Chem  # local import: keeps the module importable without a live binary
+    from rdkit.Chem import AllChem
+
+    version = xtb_version(binary)
+    if version is None:
+        return False, f"xtb binary '{resolve_xtb_binary(binary)}' is not runnable."
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("O"))
+    if AllChem.EmbedMolecule(mol, randomSeed=42) != 0:
+        return False, "could not embed the validation molecule (an RDKit problem, not xtb)."
+
+    # Distort so there is genuine strain to relax away
+    conf = mol.GetConformer()
+    pos = conf.GetAtomPosition(1)
+    conf.SetAtomPosition(1, (pos.x + 0.25, pos.y, pos.z))
+
+    first = relax_molecule(mol, binary=binary, timeout=timeout)
+    if first["error"] is not None:
+        return False, f"xtb {version} failed on the validation molecule: {first['error']}"
+
+    if first["delta_e_relax"] is None or first["delta_e_relax"] <= 0.0:
+        return False, (
+            f"xtb {version} reports dE_relax = {first['delta_e_relax']} for a distorted geometry. "
+            "Relaxation cannot raise the energy, so this build is producing wrong numbers "
+            "silently. Do not use it."
+        )
+
+    second = relax_molecule(first["opt_mol"], binary=binary, timeout=timeout)
+    if second["error"] is not None or second["delta_e_relax"] is None:
+        return False, f"xtb {version} failed re-relaxing its own minimum: {second['error']}"
+
+    if abs(second["delta_e_relax"]) > VALIDATION_IDEMPOTENCY_TOL:
+        return False, (
+            f"xtb {version} moves its own minimum by {second['delta_e_relax']:.4f} kcal/mol "
+            f"(tolerance {VALIDATION_IDEMPOTENCY_TOL}). The optimiser is not converging."
+        )
+
+    return True, (
+        f"xtb {version} validated: distorted geometry relaxed by "
+        f"{first['delta_e_relax']:.4f} kcal/mol, its own minimum by {second['delta_e_relax']:.6f}."
+    )
 
 
 def mol_to_xyz_block(mol: Chem.rdchem.Mol) -> str:

@@ -177,7 +177,14 @@ def main(args):
             f"{smolXTB.XTB_BINARY_ENV_VAR}=<prefix>/bin/xtb (or pass --xtb_binary)."
         )
 
-    print(f"Using xtb version {version}")
+    ok, message = smolXTB.validate_xtb_binary(args.xtb_binary)
+    print(f"xtb check: {message}")
+    if not ok and not args.skip_xtb_validation:
+        raise SystemExit(
+            "Refusing to run: the xtb binary failed its known-answer check, and a bad build "
+            "produces wrong numbers silently rather than erroring. Override with "
+            "--skip_xtb_validation only if you know why."
+        )
 
     mols = load_molecules(args.sdf_path, args.n_molecules)
     print(f"Loaded {len(mols)} molecules from {args.sdf_path}")
@@ -220,6 +227,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_molecules", type=int, default=DEFAULT_N_MOLECULES)
     parser.add_argument("--n_workers", type=int, default=DEFAULT_N_WORKERS)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--skip_xtb_validation", action="store_true")
     parser.add_argument(
         "--xtb_binary",
         type=str,
