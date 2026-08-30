@@ -64,59 +64,58 @@ def _geometry(coords: np.ndarray) -> dict:
     return {"radius_of_gyration": rg, "max_extent": max_extent, "mean_nn_distance": mean_nn}
 
 
-def _to_rdkit_or_none(mol, vocab):
-    """Convert to RDKit, or None if RDKit refuses the molecule outright.
+def geometry_records(mols) -> list[dict]:
+    """Per-molecule geometry, straight from the coordinates.
 
-    A collapsed generation can emit a bond list RDKit will not even build -- upstream's
-    mol_from_atoms raises "bond already exists" when the predicted adjacency contains a duplicate
-    edge. That is a validity failure, not an analysis failure: the whole point of this script is to
-    characterise generations that went wrong, so it must not itself die on them.
+    Deliberately does NOT go through RDKit. GeometricMol.to_rdkit cannot be used on a batch saved
+    by predict.py: _smol_from_tensors stores the FULL dense directed adjacency
+    (torch.ones((n, n)).nonzero(), so both (i, j) and (j, i) plus the diagonal), whereas to_rdkit
+    expects a dataset-style deduplicated bond list. Feeding it the dense form yields an invalid
+    molecule for a perfectly good generation, and raises "bond already exists" outright when the
+    predicted types make a reversed pair non-zero. Graph metrics come from the SDF instead, which
+    predict.py builds through MolBuilder's proper sanitising path.
     """
-
-    try:
-        return mol.to_rdkit(vocab)
-    except Exception:
-        return None
-
-
-def analyse(mols, vocab) -> list[dict]:
-    """One record per generated molecule: geometry plus the graph-level metrics.
-
-    Geometry is computed from the raw coordinates and never depends on the molecule being valid,
-    which is the point -- a collapsed generation has meaningful coordinates and meaningless bonds.
-    """
-
-    rdkit_mols = [_to_rdkit_or_none(mol, vocab) for mol in mols]
-    validity = per_molecule_validity(rdkit_mols, connected=False)
-    fc_validity = per_molecule_validity(rdkit_mols, connected=True)
-
-    # Stability reads the bond graph, which can be malformed enough to raise even when the molecule
-    # was constructible. Degrade to "unknown" rather than losing the whole run.
-    try:
-        atom_stable, mol_stable = per_molecule_stability(rdkit_mols)
-    except Exception:
-        atom_stable = [None] * len(rdkit_mols)
-        mol_stable = [None] * len(rdkit_mols)
 
     records = []
     for idx, mol in enumerate(mols):
         coords = np.asarray(mol.coords.detach().cpu(), dtype=np.float64)
-        record = {
-            "index": idx,
-            "n_atoms": int(mol.seq_length),
-            "rdkit_constructible": rdkit_mols[idx] is not None,
-            "valid": bool(validity[idx]),
-            "fc_valid": bool(fc_validity[idx]),
-            "atom_stable_frac": atom_stable[idx],
-            "mol_stable": mol_stable[idx],
-            **_geometry(coords),
-        }
-        records.append(record)
+        records.append({"index": idx, "n_atoms": int(mol.seq_length), **_geometry(coords)})
 
     return records
 
 
-def summarise(records: list[dict]) -> dict:
+def graph_metrics(sdf_path: Path, n_generated: int) -> dict:
+    """Validity and stability from the SDF, with the number GENERATED as the denominator.
+
+    predict.py writes only the molecules RDKit could build, so the SDF length is already
+    conditioned on success. Dividing by n_generated rather than by len(sdf) is what makes these
+    comparable to the validity logged during training.
+    """
+
+    from rdkit import Chem
+
+    if not Path(sdf_path).exists() or n_generated == 0:
+        return {}
+
+    supplier = Chem.SDMolSupplier(str(sdf_path), removeHs=False, sanitize=False)
+    mols = [mol for mol in supplier if mol is not None]
+
+    validity = per_molecule_validity(mols, connected=False)
+    fc_validity = per_molecule_validity(mols, connected=True)
+    atom_stable, mol_stable = per_molecule_stability(mols)
+
+    atom_fracs = [a for a in atom_stable if a is not None]
+    return {
+        "n_in_sdf": len(mols),
+        "rdkit_constructible_fraction": len(mols) / n_generated,
+        "validity": sum(1 for v in validity if v) / n_generated,
+        "fc_validity": sum(1 for v in fc_validity if v) / n_generated,
+        "molecule_stability": sum(1 for v in mol_stable if v) / n_generated,
+        "atom_stability": float(statistics.fmean(atom_fracs)) if atom_fracs else None,
+    }
+
+
+def summarise(records: list[dict], graph: dict = None) -> dict:
     """Aggregate, reporting median AND mean for the continuous quantities."""
 
     n = len(records)
@@ -124,13 +123,7 @@ def summarise(records: list[dict]) -> dict:
     if n == 0:
         return summary
 
-    summary["rdkit_constructible_fraction"] = sum(1 for r in records if r.get("rdkit_constructible")) / n
-    summary["validity"] = sum(1 for r in records if r["valid"]) / n
-    summary["fc_validity"] = sum(1 for r in records if r["fc_valid"]) / n
-    summary["molecule_stability"] = sum(1 for r in records if r["mol_stable"]) / n
-
-    atom_fracs = [r["atom_stable_frac"] for r in records if r["atom_stable_frac"] is not None]
-    summary["atom_stability"] = float(statistics.fmean(atom_fracs)) if atom_fracs else None
+    summary.update(graph or {})
 
     for key in ["radius_of_gyration", "max_extent", "mean_nn_distance", "n_atoms"]:
         values = [r[key] for r in records if r[key] is not None]
@@ -164,8 +157,13 @@ def main(args):
         mols = mols[: args.n_molecules]
 
     print(f"[{args.label}] analysing {len(mols)} generated molecules from {args.smol_path}")
-    records = analyse(mols, vocab)
-    summary = summarise(records)
+    records = geometry_records(mols)
+
+    sdf_path = Path(args.sdf_path) if args.sdf_path else Path(str(args.smol_path) + ".sdf")
+    graph = graph_metrics(sdf_path, len(mols))
+    if not graph:
+        print(f"  (no SDF at {sdf_path} -- geometry only; zero valid molecules is itself a result)")
+    summary = summarise(records, graph)
 
     payload = {"label": args.label, "smol_path": str(args.smol_path), "summary": summary, "records": records}
     save_path = Path(args.save_path)
@@ -173,6 +171,7 @@ def main(args):
     save_path.write_text(json.dumps(payload, indent=2))
 
     print(f"  RDKit-constructible {summary.get('rdkit_constructible_fraction')}")
+    print(f"  n in sdf          {summary.get('n_in_sdf')}")
     print(f"  validity          {summary.get('validity')}")
     print(f"  Rg median/mean    {summary.get('radius_of_gyration-median')} / {summary.get('radius_of_gyration-mean')}")
     print(f"  mean NN distance  {summary.get('mean_nn_distance-median')}")
@@ -185,6 +184,7 @@ if __name__ == "__main__":
     parser.add_argument("--smol_path", type=str, required=True)
     parser.add_argument("--label", type=str, required=True)
     parser.add_argument("--save_path", type=str, required=True)
+    parser.add_argument("--sdf_path", type=str, default=None)
     parser.add_argument("--n_molecules", type=int, default=None)
 
     args = parser.parse_args()
