@@ -64,6 +64,21 @@ def _geometry(coords: np.ndarray) -> dict:
     return {"radius_of_gyration": rg, "max_extent": max_extent, "mean_nn_distance": mean_nn}
 
 
+def _to_rdkit_or_none(mol, vocab):
+    """Convert to RDKit, or None if RDKit refuses the molecule outright.
+
+    A collapsed generation can emit a bond list RDKit will not even build -- upstream's
+    mol_from_atoms raises "bond already exists" when the predicted adjacency contains a duplicate
+    edge. That is a validity failure, not an analysis failure: the whole point of this script is to
+    characterise generations that went wrong, so it must not itself die on them.
+    """
+
+    try:
+        return mol.to_rdkit(vocab)
+    except Exception:
+        return None
+
+
 def analyse(mols, vocab) -> list[dict]:
     """One record per generated molecule: geometry plus the graph-level metrics.
 
@@ -71,10 +86,17 @@ def analyse(mols, vocab) -> list[dict]:
     which is the point -- a collapsed generation has meaningful coordinates and meaningless bonds.
     """
 
-    rdkit_mols = [mol.to_rdkit(vocab) for mol in mols]
+    rdkit_mols = [_to_rdkit_or_none(mol, vocab) for mol in mols]
     validity = per_molecule_validity(rdkit_mols, connected=False)
     fc_validity = per_molecule_validity(rdkit_mols, connected=True)
-    atom_stable, mol_stable = per_molecule_stability(rdkit_mols)
+
+    # Stability reads the bond graph, which can be malformed enough to raise even when the molecule
+    # was constructible. Degrade to "unknown" rather than losing the whole run.
+    try:
+        atom_stable, mol_stable = per_molecule_stability(rdkit_mols)
+    except Exception:
+        atom_stable = [None] * len(rdkit_mols)
+        mol_stable = [None] * len(rdkit_mols)
 
     records = []
     for idx, mol in enumerate(mols):
@@ -82,6 +104,7 @@ def analyse(mols, vocab) -> list[dict]:
         record = {
             "index": idx,
             "n_atoms": int(mol.seq_length),
+            "rdkit_constructible": rdkit_mols[idx] is not None,
             "valid": bool(validity[idx]),
             "fc_valid": bool(fc_validity[idx]),
             "atom_stable_frac": atom_stable[idx],
@@ -101,6 +124,7 @@ def summarise(records: list[dict]) -> dict:
     if n == 0:
         return summary
 
+    summary["rdkit_constructible_fraction"] = sum(1 for r in records if r.get("rdkit_constructible")) / n
     summary["validity"] = sum(1 for r in records if r["valid"]) / n
     summary["fc_validity"] = sum(1 for r in records if r["fc_valid"]) / n
     summary["molecule_stability"] = sum(1 for r in records if r["mol_stable"]) / n
@@ -148,6 +172,7 @@ def main(args):
     save_path.parent.mkdir(parents=True, exist_ok=True)
     save_path.write_text(json.dumps(payload, indent=2))
 
+    print(f"  RDKit-constructible {summary.get('rdkit_constructible_fraction')}")
     print(f"  validity          {summary.get('validity')}")
     print(f"  Rg median/mean    {summary.get('radius_of_gyration-median')} / {summary.get('radius_of_gyration-mean')}")
     print(f"  mean NN distance  {summary.get('mean_nn_distance-median')}")
