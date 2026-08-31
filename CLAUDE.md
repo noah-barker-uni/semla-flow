@@ -161,6 +161,23 @@ to *where* Sinkhorn is applied, not to how it is implemented.
    answer is `sum_j P_ij B_jj` — the self-bond row transforms like any node feature. `_bond_loss`
    does train on the diagonal (`adj_from_node_mask(..., self_connect=True)`), so this matters.
 
+7. **[FIXED] The soft bond target had no "no bond" class.** The dataset stores a non-bonded pair as
+   an ALL-ZERO vector, not a one-hot on class 0, so ~89% of pairs carry no label. The hard arms
+   survive by accident (`_ce_target` argmaxes, and `argmax([0,0,0,0,0]) == 0`, the right class); the
+   soft arm passed the raw vector to `F.cross_entropy` as class probabilities, so an unlabelled pair
+   gave **zero loss and zero gradient**. `P B P^T` then redistributed only the ~11% of real-bond
+   mass, leaving class 0 at exactly 0.000 at every t. The model was never taught that a pair can be
+   unbonded, and generated **complete graphs**: 99.9% of pairs came out order 1, 96.8% of molecules
+   were fully connected, validity exactly 0.000. `fm.py:densify_bond_labels` now fills class 0
+   before the blend (padding pairs stay empty). **No-op for every hard arm** -- it moves no argmax --
+   so only `none_sinkhorn` needed rerunning; `tests/target.py` pins that.
+
+   Consequence for the write-up: **the 0% validity was NOT evidence that averaging categorical
+   targets destroys the bond graph.** That claim is unsupported until the rerun lands. The
+   coordinate findings are unaffected -- `none_sinkhorn-hardcat` uses the argmax path, so its
+   dE_relax of 2803 is a genuine result about averaging coordinates, as are the target-collapse
+   table and the cost decomposition.
+
 ### All existing Sinkhorn/MCMC numbers are uninterpretable
 
 Reported so far: Sinkhorn straighter (1.11-1.14 vs Hungarian 1.16-1.21, p~1e-195), lower X-hat_1
@@ -383,7 +400,7 @@ are grouped by arm so "mean +/- band across seeds" is two clicks rather than a C
 | hungarian_hard | 0.9924 | **9.29 / 13.5** | **0.0234** | **1.59** | **0.094** |
 | none_hard | 0.9938 | 10.01 / 15.2 | 0.0246 | 1.71 | 0.109 |
 | none_mcmc | 0.9672 | 14.28 / 53.3 | 0.0294 | 1.86 | 0.139 |
-| none_sinkhorn | **0.0000** | — | — | — | — |
+| none_sinkhorn | **0.0000** | — | — | — | — |   <!-- VOID: bond-label defect, see 7 -->
 | none_sinkhorn-hardcat | 0.9496 | **768.7 / 2803** | **0.252** | **16.4** | **0.808** |
 
 Read this before designing anything further:
