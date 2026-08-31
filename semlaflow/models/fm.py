@@ -213,6 +213,37 @@ def permutation_target(
     return target_batch, diagnostics
 
 
+def densify_bond_labels(bonds: _T, node_mask: Optional[_T] = None) -> _T:
+    """Put the implicit "no bond" mass onto class 0, so every pair carries a proper one-hot.
+
+    The dataset stores a non-bonded pair as an ALL-ZERO vector rather than a one-hot on class 0
+    ("no bond"), so on QM9 roughly 89% of pairs carry no label at all. The hard path survives this
+    by accident: `_ce_target` takes an argmax, and the argmax of an all-zero vector is 0, which
+    happens to be the correct class. The soft path does not -- it hands the raw vector to
+    `F.cross_entropy` as class probabilities, so an unlabelled pair contributes zero loss and zero
+    gradient and the model is never taught that a pair can be unbonded. Blending then redistributes
+    only the ~11% of real-bond mass and leaves class 0 at exactly zero for every pair at every t.
+    The observable consequence was a Sinkhorn arm that put a single bond between essentially every
+    pair of atoms: 97% of its generated molecules were complete graphs and validity was 0.000.
+
+    Filling the class before blending makes `P B P^T` a genuine distribution over bond types. This
+    is a no-op for every hard arm -- it moves no argmax -- which `tests/target.py` pins.
+    """
+
+    missing = (1.0 - bonds.sum(dim=-1)).clamp_min(0.0)
+
+    # Padding pairs stay all-zero. They are masked out of the loss anyway, and leaving them empty
+    # preserves the invariant the rest of the code and tests rely on: a padded slot carries no
+    # label of any kind, rather than a confident "these two non-existent atoms are not bonded".
+    if node_mask is not None:
+        valid = smolF.adj_from_node_mask(node_mask.long(), self_connect=True)
+        missing = missing * valid.to(missing.dtype)
+
+    out = bonds.clone()
+    out[..., 0] = out[..., 0] + missing
+    return out
+
+
 def apply_plan(plan: _T, data: _BatchT, blend_categoricals: bool = True) -> _BatchT:
     """Apply a row-stochastic plan to a data batch.
 
@@ -257,7 +288,11 @@ def apply_plan(plan: _T, data: _BatchT, blend_categoricals: bool = True) -> _Bat
     # guarantee a contraction order for three operands, and the naive order materialises
     # [B, N, N, N, E] -- several GB at GEOM-Drugs sizes. molrepr.py's soft_permute gets away with
     # the three-operand form only because it runs on one molecule at a time.
-    bonds = torch.einsum("bij,bjkc->bikc", plan, data["bonds"])
+    # Fill the implicit "no bond" class BEFORE blending -- after P B P^T the mass cannot be
+    # recovered, since the plan has already redistributed only what was labelled.
+    bond_labels = densify_bond_labels(data["bonds"], data["mask"])
+
+    bonds = torch.einsum("bij,bjkc->bikc", plan, bond_labels)
     bonds = torch.einsum("blk,bikc->bilc", plan, bonds)
 
     # (P B P^T)_ii = sum_{j,k} P_ij P_ik B_jk treats sigma(i) as two independent draws, but on the
@@ -265,7 +300,7 @@ def apply_plan(plan: _T, data: _BatchT, blend_categoricals: bool = True) -> _Bat
     # self-bond row is a single-index quantity and transforms like any other node feature. Restore
     # it exactly: _bond_loss does train on the diagonal, since adj_from_node_mask is built with
     # self_connect=True.
-    diag = torch.einsum("bij,bjc->bic", plan, data["bonds"].diagonal(dim1=1, dim2=2).transpose(1, 2))
+    diag = torch.einsum("bij,bjc->bic", plan, bond_labels.diagonal(dim1=1, dim2=2).transpose(1, 2))
     bonds = bonds.diagonal_scatter(diag.transpose(1, 2), dim1=1, dim2=2)
 
     return {

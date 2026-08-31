@@ -1,0 +1,372 @@
+\section{Experiments}
+
+\subsection{Setup}
+
+All experiments are built on SemlaFlow, one of the three mixed-domain flow matching models
+described in Section~\ref{sec:existing-models}. It was chosen because it is fully open source,
+uses the endpoint prediction parameterisation of Section~\ref{sec:flow-matching} (so the
+averaged target of Section~\ref{sec:research-gap} is exactly the quantity its coordinate loss
+already regresses towards), and because it isolates Hungarian alignment as a single step in its
+training loop, meaning permutation averaging can be introduced by replacing one function.
+
+\paragraph{The four training variants.}
+We compare four ways of choosing the pairing between noise and data, and nothing else. Given a data
+molecule $z$, a noise sample $x$ and a time $t$, the variants are:
+
+\begin{itemize}
+    \item \textbf{None.} No alignment. The interpolant is built directly from the sampled pair and
+        the target is $z$ itself. This is the independent-coupling floor.
+    \item \textbf{Hungarian.} Before interpolating, the noise is permuted onto the data: the
+        Hungarian algorithm is run on $C_{ij} = \|z_i - x_j\|^2$ to give $\sigma^*$, and the
+        interpolant is built from $P_{\sigma^*} x$ rather than $x$. The target remains $z$. This is
+        the standard practice described in Section~\ref{sec:hungarian-kabsch} and is the published
+        baseline.
+    \item \textbf{Sinkhorn.} The interpolant is built from the sampled pair as in \textsc{None},
+        and the \emph{target} is then replaced by $\bar{P} z$, where $\bar{P}$ is the doubly
+        stochastic matrix returned by the Sinkhorn algorithm on the cost matrix and temperature of
+        Equation~\eqref{eq:sinkhorn-temperature}. This is the deterministic approximation to
+        permutation averaging of Section~\ref{sec:sinkhorn-approx}.
+    \item \textbf{Metropolis.} As \textsc{Sinkhorn}, but the target is $P_\sigma z$ for a single
+        permutation $\sigma$ drawn from $q_t(\sigma \mid x_t, z)$ by the Markov chain of
+        Section~\ref{sec:metropolis-sampling}. This is the unbiased stochastic counterpart to
+        Sinkhorn.
+\end{itemize}
+
+Two differences between these are worth making explicit, because they are easy to miss.
+
+First, \emph{which side} the permutation is applied to. Hungarian alignment as implemented permutes
+the noise, but it could equally be written as permuting the data, and the two give the same
+objective. Since $P_{\sigma^*}$ is orthogonal,
+$\|P_{\sigma^*} x - z\|^2 = \|x - P_{\sigma^*}^\top z\|^2$, so the two minimisation problems
+correspond. Relabelling every atom slot of the first by $P_{\sigma^*}^\top$ gives
+$P_{\sigma^*}^\top x_t = (1-t)x + t P_{\sigma^*}^\top z$ with target $P_{\sigma^*}^\top z$, which is
+the second; and since $f^\theta$ is permutation-equivariant and the loss is a sum over atoms (and,
+for bonds, over pairs, with $e \mapsto P e P^\top$), relabelling both the prediction and the target
+by the same permutation leaves the loss unchanged. Hungarian may therefore be read either way.
+
+This is a statement about which \emph{side} the permutation acts on, and not about \emph{when} it is
+computed --- those are different questions, and the answer to the second is given below.
+
+Second, \emph{what} the permutation is computed from, and here the choice genuinely matters. The
+Hungarian cost compares the raw noise with the data, since at that point no interpolant exists yet.
+The Sinkhorn and Metropolis costs compare $x_t$ with $tz$, as required by the posterior of
+Equation~\eqref{eq:permutation-posterior}, which is only defined given a point part-way along the
+flow. These are not the same assignment problem. Discarding the terms that do not depend on
+$\sigma$, minimising either cost is equivalent to maximising an inner-product score, and
+substituting $x_t = (1-t)x + tz$ relates the two exactly:
+\begin{equation}
+    S_{x_t}(\sigma) = (1-t)\, S_{x}(\sigma) \;+\; t\, S_{z}(\sigma),
+    \qquad
+    S_{a}(\sigma) := \sum_{i=1}^{N} \langle a_i,\, z_{\sigma(i)} \rangle .
+    \label{eq:cost-decomposition}
+\end{equation}
+The second term is maximised at the identity: by Cauchy--Schwarz
+$\langle z_i, z_{\sigma(i)}\rangle \le \|z_i\|\|z_{\sigma(i)}\|$, and
+$\sum_i \|z_i\|\|z_{\sigma(i)}\| \le \sum_i \|z_i\|^2$ for any permutation, again by
+Cauchy--Schwarz. So the cost built from $x_t$ is the cost built from $x$ plus a bias towards the
+identity of relative weight $t/(1-t)$. The two coincide only in the limit $t \to 0$, where the cost
+becomes uniform and every permutation is equally good, consistent with
+Section~\ref{sec:sinkhorn-approx}. The consequence of this is taken up in the discussion.
+
+A consequence of the first point is that all four models are trained to transport the same prior. A
+permutation of independent Gaussian noise is still independent Gaussian noise, so the Hungarian arm
+does not change the distribution its network learns to start from; and the averaging arms do not
+touch the noise at all. The four models are therefore directly comparable at generation time, where
+each is simulated from an ordinary Gaussian sample. Note that this would \emph{not} hold if
+$\bar{P}$ were applied to the noise rather than the target: a doubly stochastic matrix is a convex
+combination of permutations rather than a permutation, so averaging the noise would shrink its
+variance and train the model on a prior that does not exist at sampling time.
+
+\begin{algorithm}
+\caption{Permutation-Averaged Flow Matching Training}
+\label{alg:permutation-averaged-training}
+\begin{algorithmic}[1]
+\Require Dataset $z \sim p_\mathcal{D}$, priors $p_{\text{init}}$ for each variable, network
+    $f^\theta$, method $\in \{\textsc{None}, \textsc{Hungarian}, \textsc{Sinkhorn},
+    \textsc{Metropolis}\}$.
+\For{each mini-batch of data}
+    \State Sample a molecule $z = (r, a, c, e) \sim p_\mathcal{D}$ with $N$ atoms
+    \State Sample a time $t \sim \mathcal{U}(0,1)$
+    \State Sample an initial molecule $x = (r_0, a_0, c_0, e_0)$, each component from its prior
+    \If{method $=$ \textsc{Hungarian}} \Comment{align the noise, before interpolating}
+        \State $\sigma^* \gets$ Hungarian solution of $C_{ij} = \|z_i - x_j\|^2$
+        \State $x \gets P_{\sigma^*} x$
+    \EndIf
+    \State Rotate $x$ onto $z$ with the Kabsch algorithm
+    \State Set $x_t \gets (1-t)\,x + t\,z$, blending coordinates and resampling each categorical
+        variable from $z$ with probability $\kappa_t$
+    \State $z' \gets z$ \Comment{the target, modified only by the averaging methods}
+    \If{method $\in \{\textsc{Sinkhorn}, \textsc{Metropolis}\}$}
+        \State $C_{ij} \gets \|(x_t)_i - t z_j\|^2$, \quad
+            $\varepsilon_t \gets 2(1-t)^2$
+        \If{method $=$ \textsc{Sinkhorn}}
+            \State $\bar{P} \gets \textsc{Sinkhorn}(C, \varepsilon_t)$
+        \Else
+            \State $\bar{P} \gets P_\sigma$, $\sigma$ a sample from $q_t(\cdot \mid x_t, z)$
+        \EndIf
+        \State $z' \gets (\bar{P}r,\; \bar{P}a,\; \bar{P}c,\; \bar{P}e\bar{P}^\top)$
+    \EndIf
+    \State Compute the loss of Equation~\eqref{eq:mixed-domain-loss} using $z'$ in place of $z$
+    \State Update parameters $\theta \gets \mathrm{grad\_update}(\mathcal{L}(\theta))$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Method parameters.}
+The Sinkhorn iteration is run for $100$ steps, which is enough for the row and column sums to
+agree with their targets to within $10^{-2}$ at every $t$. The Metropolis chain is run for $100$
+steps. Two details differ slightly from the description in Section~\ref{sec:metropolis-sampling}.
+First, the chain is initialised at the identity permutation rather than at the Hungarian solution:
+because $x_t$ is constructed from $z$ in its given atom order, the identity \emph{is} the
+permutation that produced $x_t$, so it is already a high-probability starting point and is
+available without solving an assignment problem inside the training loop. Second, rather than
+imposing a distance threshold $d_{\max}$, proposals are restricted to swaps between each atom and
+its $8$ nearest neighbours in $x_t$; this has the same effect of suppressing proposals that would
+be rejected almost surely, but does not require a threshold to be tuned per dataset.
+
+The temperature $\varepsilon_t$ carries no free hyperparameter, being fixed by the variance of the
+conditional path. This is deliberate: it means the Sinkhorn arm cannot be made to look better or
+worse by tuning, and any difference from the Hungarian arm is attributable to the averaging itself.
+
+\paragraph{What is held fixed.}
+Kabsch alignment is enabled in all four arms. This is the harder test, since any benefit from
+permutation averaging must appear on top of rotation alignment rather than as a substitute for it,
+and it keeps the Hungarian arm faithful to the published baseline. We do \emph{not} experiment with
+rotation averaging in the de novo setting, even though the results of
+Section~\ref{sec:rotation-averaging} have not previously been transferred to this domain; and we do
+not attempt to combine rotation and permutation averaging, which is not straightforward because the
+optimal rotation and the optimal permutation depend on one another. Both are left for future work
+contingent on permutation averaging succeeding in isolation. Architecture, optimiser, data order,
+noise draws and sampling schedule are identical across arms, and all four use the same random seed.
+
+\paragraph{Training.}
+All models are trained on QM9 for $300$ epochs at a constant learning rate of $3\times 10^{-4}$
+after $2000$ warm-up steps, with gradients clipped at norm $1$. Times are sampled uniformly,
+$t \sim \mathrm{Beta}(1,1)$. The loss weights of Equation~\eqref{eq:mixed-domain-loss} are
+$\lambda_a = 0.2$ for atom types, $\lambda_c = 1.0$ for charges and $\lambda_e = 0.5$ for bonds,
+with the coordinate term at unit weight. These are the reference values for this architecture,
+of which only the bond weight is specific to QM9 --- it is halved from the value used for
+GEOM-Drugs, since QM9's molecules are small enough that the bond term would otherwise dominate.
+Each run takes approximately six to seven hours on a single GH200 GPU.
+
+\paragraph{Generation.}
+Molecules are generated by simulating the joint process of Algorithm~\ref{alg:joint-simulation}
+with the Euler method on a uniform grid of $100$ steps over $[0,1]$, so $h = 0.01$. The coordinate
+update is $r_{t+h} = r_t + h\,v^\theta_t$, with the vector field recovered from the endpoint
+prediction by Equation~\eqref{eq:endpoint-to-vector-field}, which for $\alpha_t = t$,
+$\beta_t = 1-t$ is simply $v^\theta_t = (r^\theta_t(w_t) - r_t)/(1-t)$. The atom type, charge and
+bond components are updated by the corresponding jump step of Equation~\eqref{eq:dfm-jump} on the
+same grid. Simulation is otherwise deterministic: no noise is added to the coordinate update. Since
+the network is called once per step, $100$ steps corresponds to an NFE of $100$.
+
+\paragraph{Evaluation.}
+Each trained model generates $5000$ molecules. We report validity and
+molecule stability computed with the corrected valency table discussed in
+Section~\ref{sec:evaluation}, and, for the 3D domain, GFN2-xTB rather than MMFF: each generated
+molecule is relaxed and we record the relaxation energy $\Delta E_{\text{relax}}$ together with the
+mean bond length, bond angle and torsion deviations between the generated molecule and its own
+relaxed counterpart, plus the RMSD between the two. Following the recommendation in
+Section~\ref{sec:evaluation}, each of these is reported as both a median and a mean, since the
+distributions are right-skewed and the two capture different failure modes: the median describes
+typical geometry quality, the mean the rate of catastrophic failures. Uniqueness and novelty are
+not reported, for the reasons given there.
+
+We also report a diagnostic requiring no trained model at all: the ratio
+$\|\bar{P}z\| / \|z\|$ measured on real QM9 molecules as a function of $t$, together with the
+effective number of atoms $1 / \sum_j \bar{P}_{ij}^2$ being averaged into each row of the target.
+These describe the training target itself and are used in the discussion.
+
+\subsection{Results}
+
+Table~\ref{tab:qm9-results} gives the headline numbers. We report QM9 only. The failure described
+below is severe enough that training on GEOM-Drugs would not be informative: a method that destroys
+the smaller and easier dataset is extremely unlikely to succeed on the larger and harder one.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcccccc}
+\hline
+ & & $\Delta E_{\text{relax}}$ & Bond length & Bond angle & Torsion & RMSD \\
+Method & Validity & (kcal/mol) & (\AA) & ($^\circ$) & ($^\circ$) & (\AA) \\
+\hline
+None        & 0.994 & 15.2 & 0.029 & 2.04 & 6.66 & 0.197 \\
+Hungarian   & 0.992 & \textbf{13.5} & \textbf{0.027} & \textbf{1.88} & \textbf{5.94}
+            & \textbf{0.180} \\
+Sinkhorn    & 0.000 & --- & --- & --- & --- & --- \\
+Metropolis  & 0.967 & 53.3 & 0.034 & 2.25 & 7.93 & 0.235 \\
+\hline
+Sinkhorn-HC & 0.950 & 2803 & 0.297 & 16.7 & 35.5 & 0.859 \\
+\hline
+\end{tabular}
+\caption{QM9 results, $5000$ molecules per method at $100$ integration steps, one seed. Every 3D
+column is a mean deviation from the molecule's own GFN2-xTB-relaxed counterpart, so lower is better
+throughout. The relaxation succeeded and converged for between $97\%$ and $99.9\%$ of the molecules
+in each set. Sinkhorn-HC is the ablation described below, in which coordinates are averaged but the
+categorical targets are left as hard one-hot labels.}
+\label{tab:qm9-results}
+\end{table}
+
+\paragraph{A note on the metrics reported.}
+Two remarks on what Table~\ref{tab:qm9-results} does and does not contain.
+
+Atom and molecule stability are both omitted because on QM9 they are degenerate. Atom stability is
+$1.000$ for every method: under the corrected valency table, every molecule that RDKit could
+construct had all of its atoms in a valid valency state. Molecule stability follows from this and
+is consequently equal to validity to four decimal places in all five cases, so it would duplicate a
+column already present. Validity is therefore the only 2D metric that carries any information here,
+and it does not separate the four methods either --- with the single exception of the Sinkhorn arm,
+which it separates only because that arm produces nothing usable at all. All of the discrimination
+in the table comes from the 3D columns, which is a concrete instance of the concern raised in
+Section~\ref{sec:evaluation} about 2D metrics saturating.
+
+The 3D columns are means. All five distributions are right-skewed, so the medians are smaller
+throughout, and by varying amounts: the ratio of mean to median is around $1.2$ for bond lengths
+and angles, but reaches $1.9$ for RMSD and $3.7$ for the relaxation energy of the Metropolis arm,
+where a small number of badly-formed molecules dominates the average. The ranking of the methods is
+the same under either statistic for all five metrics, so nothing that follows depends on the
+choice; where the difference between the two is itself informative it is given explicitly in the
+text.
+
+\paragraph{Neither averaging method improves on hard alignment.}
+Hungarian alignment is the best method on every 3D metric, and the improvement over no alignment at
+all is consistent but small (Cliff's $\delta = -0.08$ on $\Delta E_{\text{relax}}$, with a
+bootstrap confidence interval on the difference of medians of $[-1.09, -0.41]$ kcal/mol). The
+Metropolis target is worse than Hungarian on every metric and worse than no alignment at all
+(Cliff's $\delta = +0.31$). Its relaxation energy is the clearest case where the mean and the
+median disagree: $53.3$ kcal/mol against a median of $14.3$, where the baseline sits at $15.2$ and
+$10.0$. The typical Metropolis molecule is therefore only modestly worse than the baseline, and the
+inflated mean comes from a tail of badly-formed molecules rather than from a uniform degradation.
+The Sinkhorn target fails completely: not a single one of its $5000$ generated molecules could be
+constructed by RDKit.
+
+\paragraph{The Sinkhorn failure is in the bond graph, not the geometry.}
+A zero validity score reports only that the molecular graph is unusable, so it is worth asking
+whether the coordinates collapsed as well. They did not. The Sinkhorn samples have a median radius
+of gyration of $2.08$~\AA{} against $2.31$~\AA{} for the working methods, and a mean
+nearest-neighbour distance of $1.13$~\AA{}, which is an ordinary bond length. The molecules are
+therefore of roughly the right size and their atoms are appropriately spaced; what is wrong is the
+predicted bond graph.
+
+\paragraph{Isolating the categorical channel.}
+Since permutation averaging changes both the coordinate target and the categorical targets, we ran
+one further ablation, \textbf{Sinkhorn-HC}, in which the doubly stochastic matrix is applied to the
+coordinates as before but the atom type, charge and bond targets are left as the hard one-hot
+labels of the identity permutation. Validity is restored from $0.000$ to $0.950$, confirming that
+the mixing of categorical targets is what makes the bond graph unconstructible.
+
+The recovery is only apparent, however. Under GFN2-xTB the Sinkhorn-HC molecules are far worse than
+any other arm: a median relaxation energy of $769$ kcal/mol against $10$ for the baseline, bond
+lengths wrong by $0.25$~\AA{} rather than $0.025$~\AA{}, and bond angles wrong by $16^\circ$ rather
+than $1.7^\circ$. The separation from the baseline is essentially total (Cliff's $\delta = 0.995$).
+So the two channels fail independently and for different reasons: averaging the categorical targets
+destroys the graph, and averaging the coordinate targets destroys the geometry. It is worth noting
+that neither validity nor radius of gyration detected the second failure --- Sinkhorn-HC looks
+healthy on both --- and it was only visible once a quantum-chemical method was used.
+
+\paragraph{The averaged target collapses towards the origin.}
+Table~\ref{tab:target-collapse} measures the training target directly, with no model involved. At
+small $t$ the Sinkhorn plan is close to uniform, so each row of $\bar{P}z$ is close to the mean of
+all $N$ atom positions. QM9 molecules are centred at the origin, so that mean is the origin, and
+the regression target is close to zero.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccccc}
+\hline
+$t$ & 0.05 & 0.2 & 0.5 & 0.7 & 0.9 & 0.95 \\
+\hline
+$\|\bar{P}z\| / \|z\|$ & 0.04 & 0.20 & 0.62 & 0.87 & 0.99 & 0.99 \\
+Effective atoms averaged & 17.3 & 15.8 & 7.5 & 3.1 & 1.2 & 1.1 \\
+\hline
+\end{tabular}
+\caption{The Sinkhorn target measured on real QM9 molecules. The ratio is the mean per-atom
+distance of the target from the origin, divided by the same quantity for the unmodified data
+molecule; the effective atom count is $1 / \sum_j \bar{P}_{ij}^2$. For the Hungarian and Metropolis
+methods the ratio is exactly $1$ at every $t$, since both apply a genuine permutation.}
+\label{tab:target-collapse}
+\end{table}
+
+The behaviour at the two ends of the flow is exactly what Section~\ref{sec:sinkhorn-approx}
+predicts, and in that sense the implementation is working as designed: the plan is uniform at
+$t \to 0$ and converges to a single permutation at $t \to 1$. The problem is what this implies for
+training. Over the whole first half of every trajectory the model is being asked to predict
+something close to the centroid of the molecule rather than the molecule, and since the endpoint
+prediction is converted into a vector field by Equation~\eqref{eq:endpoint-to-vector-field}, the
+early part of the simulated flow is driven by a network trained to point at the origin.
+
+\subsection{Discussion}
+
+Neither approximation to permutation averaging improved on hard Hungarian alignment, and the
+deterministic one failed outright. Three explanations account for what we observe.
+
+\paragraph{The cost matrix ignores the discrete domain.}
+The cost $C_{ij} = \|(x_t)_i - t z_j\|^2$ is purely geometric, so a carbon paired with a hydrogen
+is considered exactly as good as a carbon paired with a carbon at the same distance. Under hard
+alignment this is tolerable, since the result is still a genuine relabelling of a real molecule and
+the target remains a valid chemical structure whichever permutation is chosen. Under averaging it
+is not: the plan spreads mass across atoms that happen to be nearby regardless of what they are,
+and the resulting target asks the network to predict an atom that is part carbon and part hydrogen,
+with bonds to match. The zero validity of the Sinkhorn arm and its recovery under Sinkhorn-HC show
+that this is not a minor effect but the dominant one in the categorical channel. A cost that
+included a penalty for mismatched atom types would concentrate the plan on chemically sensible
+pairings and is the most obvious thing to try next.
+
+\paragraph{Averaging over permutations of a known molecule is not the same as averaging over
+endpoints.}
+The justification for an averaged target in Section~\ref{sec:rotation-averaging} is that the
+endpoint prediction is trying to learn $\mathbb{E}_{z \sim p(z \mid x_t)}[z]$, so replacing a single
+representative by an average over representations moves the target towards what the loss is already
+estimating. This argument requires the average to be taken over the correct conditioning set. What
+$\bar{P}z$ actually computes is an average over permutations of the \emph{specific} molecule $z$
+drawn in that mini-batch, which conditions on information the network does not have. The result
+moves the target away from $z$ without moving it towards $\mathbb{E}[z \mid x_t]$; it moves it
+towards that one molecule's centroid, which is what Table~\ref{tab:target-collapse} shows. The
+target is being averaged over the wrong thing.
+
+\paragraph{The posterior is peaked on the identity by construction.}
+Equation~\eqref{eq:cost-decomposition} makes the self-consistency of the construction explicit. The
+cost is built from $x_t$, but $x_t$ was itself built from $z$ in its given atom order, so the
+identity is the permutation that produced it and the cost carries an explicit bias towards the
+identity at every $t$, not merely in the limit. The two contributions have very different scales:
+$S_z(\mathrm{id}) = \sum_i \|z_i\|^2$ is large and positive, whereas $S_x$ is a sum of inner
+products between independent vectors and is close to zero in expectation. Measuring this on random
+$18$-atom problems, the permutation minimising the $x_t$-based cost already differs from the one
+minimising the $x$-based cost in more than half of cases at $t = 0.05$, and never agrees with it
+beyond $t = 0.2$; by $t = 0.8$ it is the identity in $63\%$ of cases and by $t = 0.95$ in
+essentially all of them.
+
+This is not in itself an error --- $x_t$ really does carry information about which permutation
+generated it, and a posterior given $x_t$ ought to reflect that. The difficulty is that the
+generating permutation is always the identity here, so the posterior concentrates on it for a
+reason that has nothing to do with the geometry of the molecule. Combined with the previous
+paragraph, the picture is that at low $t$ the target is smeared across the whole molecule and at
+high $t$ it is pinned to the permutation it started from, leaving only a narrow band of $t$ in which
+the averaging is doing anything both non-trivial and informative.
+
+\paragraph{Why the same problem does not arise for rotations.}
+It is fair to ask why the rotation-averaged objective of Section~\ref{sec:rotation-averaging}
+succeeds when the permutation analogue does not, since averaging a molecule over all of $SO(3)$ at
+$t \to 0$ would also produce a spherically symmetric and thus uninformative target. Two differences
+matter. First, $SO(3)$ is a three-dimensional compact group whereas $S_N$ has $N!$ elements, so the
+permutation posterior is diffuse over a vastly larger set and concentrates far more slowly in $t$;
+Table~\ref{tab:target-collapse} shows more than seventeen atoms still being averaged at $t = 0.2$.
+Second, and more importantly, a rotation acts only on coordinates and leaves the discrete domain
+untouched, so rotation averaging has no categorical channel to damage. Permutation averaging has
+both problems and the discrete one is the more severe.
+
+\paragraph{Is permutation averaging hopeless?}
+These results do not establish that. What they establish is that this particular construction of it
+fails, and they identify two specific reasons why. Both are properties of how the posterior was
+defined rather than of the idea of averaging over permutations: a cost matrix blind to atom types,
+and a posterior conditioned on the batch's own data molecule. Since the failure is severe rather
+than marginal, however, the honest conclusion at this point is that permutation-averaged flow
+matching does not work as a drop-in replacement for Hungarian alignment, and that the burden is on
+a future version to fix the conditioning before the hypothesis of
+Section~\ref{sec:research-gap} can be tested properly.
+
+\paragraph{A caveat on the strength of these claims.}
+Each arm was trained once, so strictly these numbers compare five trained models rather than five
+methods, and run-to-run variation is not separated out. The Sinkhorn and Sinkhorn-HC effects are
+far too large for this to matter. The advantage of Hungarian over no alignment, however, is small
+enough that it would need further seeds before being claimed with confidence.

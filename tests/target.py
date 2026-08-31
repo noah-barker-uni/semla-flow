@@ -5,7 +5,12 @@ import torch
 import torch.nn.functional as F
 
 import semlaflow.util.functional as smolF
-from semlaflow.models.fm import TARGET_MIN_EPS, apply_plan, permutation_target
+from semlaflow.models.fm import (
+    TARGET_MIN_EPS,
+    apply_plan,
+    densify_bond_labels,
+    permutation_target,
+)
 
 
 def _fixture(sizes=(5, 3, 6), t=0.7, seed=0, vocab_size=4, n_bond_types=3, n_charges=7, sigma=None):
@@ -100,6 +105,10 @@ class PermutationTargetTests(unittest.TestCase):
             data, interpolated, times, "sinkhorn", sinkhorn_iters=2000, eps_override=eps
         )
         expected = _gather_hard(data, sigma)
+        # The soft path fills the implicit "no bond" class before blending, so the eps -> 0 limit
+        # is the densified hard target rather than the sparse one the dataset stores. Both encode
+        # the same labelling; only the unbonded pairs are written explicitly.
+        expected["bonds"] = densify_bond_labels(expected["bonds"], data["mask"])
 
         for key in ["coords", "atomics", "bonds", "charges"]:
             np.testing.assert_almost_equal(
@@ -466,6 +475,100 @@ class SoftCrossEntropyTests(unittest.TestCase):
 
         self.assertEqual(hard.shape, soft.shape)
         self.assertTrue(torch.allclose(hard, soft, atol=1e-6))
+
+
+
+class BondLabelDensityTests(unittest.TestCase):
+    """The dataset stores a non-bonded pair as an ALL-ZERO vector, not a one-hot on "no bond".
+
+    That is invisible to the hard arms, which argmax the target (argmax of all-zeros is 0, the
+    correct class), and fatal to the soft one, which passes the vector to cross-entropy as class
+    probabilities. These pin both halves: the soft target must become a genuine distribution, and
+    no hard arm's label may move.
+    """
+
+    def _sparse_bonds(self, b=3, n=7, e=5, p=0.11, seed=0):
+        """A bond tensor stored the way the dataset stores it: real bonds one-hot, the rest zero."""
+
+        g = torch.Generator().manual_seed(seed)
+        bonds = torch.zeros(b, n, n, e)
+        real = torch.rand(b, n, n, generator=g) < p
+        cls = torch.randint(1, e, (b, n, n), generator=g)
+        bonds[real] = F.one_hot(cls[real], e).float()
+        # real data has no self-bonds: the diagonal is always empty before densifying
+        bonds[:, torch.arange(n), torch.arange(n)] = 0.0
+        return bonds
+
+    def test_all_zero_rows_become_no_bond_one_hots(self):
+        bonds = self._sparse_bonds()
+        self.assertLess((bonds.sum(-1) == 1).float().mean().item(), 0.3)   # the defect is present
+        self.assertEqual(bonds[..., 0].sum().item(), 0.0)                  # class 0 never set
+
+        fixed = densify_bond_labels(bonds)
+        self.assertTrue(torch.allclose(fixed.sum(-1), torch.ones_like(fixed.sum(-1))))
+        self.assertGreater(fixed[..., 0].mean().item(), 0.5)
+
+    def test_real_bonds_are_untouched(self):
+        bonds = self._sparse_bonds()
+        real = bonds.sum(-1) == 1
+        fixed = densify_bond_labels(bonds)
+        self.assertTrue(torch.equal(fixed[real], bonds[real]))
+
+    def test_no_argmax_moves_so_every_hard_arm_is_unchanged(self):
+        """The whole reason only the sinkhorn arm needs rerunning."""
+
+        bonds = self._sparse_bonds()
+        fixed = densify_bond_labels(bonds)
+        self.assertTrue(torch.equal(bonds.argmax(-1), fixed.argmax(-1)))
+
+        # and the cross-entropy the hard path actually computes is bit-identical
+        logits = torch.randn(*bonds.shape)
+        before = F.cross_entropy(logits.flatten(0, 2), bonds.argmax(-1).flatten(0, 2), reduction="none")
+        after = F.cross_entropy(logits.flatten(0, 2), fixed.argmax(-1).flatten(0, 2), reduction="none")
+        self.assertTrue(torch.equal(before, after))
+
+    def test_hard_permutation_still_lands_on_the_same_class(self):
+        """The mcmc arm applies a genuine permutation, so its argmax must survive the round trip."""
+
+        bonds = self._sparse_bonds()
+        n = bonds.size(1)
+        perm = torch.eye(n)[torch.randperm(n)].expand(bonds.size(0), n, n)
+        blend = lambda x: torch.einsum("blk,bikc->bilc", perm, torch.einsum("bij,bjkc->bikc", perm, x))
+        self.assertTrue(torch.equal(blend(bonds).argmax(-1), blend(densify_bond_labels(bonds)).argmax(-1)))
+
+    def test_soft_blend_is_a_distribution_with_no_bond_mass(self):
+        """Under a near-uniform plan the blended target must still sum to 1 and favour "no bond"."""
+
+        bonds = self._sparse_bonds()
+        b, n = bonds.size(0), bonds.size(1)
+        plan = torch.full((b, n, n), 1.0 / n)
+        data = {
+            "coords": torch.randn(b, n, 3),
+            "atomics": F.one_hot(torch.randint(0, 4, (b, n)), 4).float(),
+            "bonds": bonds,
+            "charges": F.one_hot(torch.randint(0, 7, (b, n)), 7).float(),
+            "mask": torch.ones(b, n, dtype=torch.long),
+        }
+        out = apply_plan(plan, data)["bonds"]
+        self.assertTrue(torch.allclose(out.sum(-1), torch.ones_like(out.sum(-1)), atol=1e-5))
+        self.assertGreater(out[..., 0].mean().item(), 0.5)
+
+    def test_the_diagonal_is_no_bond_not_empty(self):
+        """Self-bonds are trained on (adj_from_node_mask uses self_connect=True)."""
+
+        bonds = self._sparse_bonds()
+        b, n = bonds.size(0), bonds.size(1)
+        data = {
+            "coords": torch.randn(b, n, 3),
+            "atomics": F.one_hot(torch.randint(0, 4, (b, n)), 4).float(),
+            "bonds": bonds,
+            "charges": F.one_hot(torch.randint(0, 7, (b, n)), 7).float(),
+            "mask": torch.ones(b, n, dtype=torch.long),
+        }
+        out = apply_plan(torch.eye(n).expand(b, n, n), data)["bonds"]
+        diag = out.diagonal(dim1=1, dim2=2).transpose(1, 2)   # mask is all ones in this fixture
+        self.assertTrue(torch.allclose(diag.sum(-1), torch.ones_like(diag.sum(-1)), atol=1e-5))
+        self.assertTrue(torch.allclose(diag[..., 0], torch.ones_like(diag[..., 0]), atol=1e-5))
 
 
 if __name__ == "__main__":
