@@ -29,3 +29,6 @@ nohup.out
 # Slurm submission scripts and logs
 subslurm/
 slurm-*
+
+.DS_Store
+**/.DS_Store
