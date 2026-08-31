@@ -240,6 +240,11 @@ inflated mean comes from a tail of badly-formed molecules rather than from a uni
 The Sinkhorn target fails completely: not a single one of its $5000$ generated molecules could be
 constructed by RDKit.
 
+%% ==== PENDING: the Sinkhorn arm is being rerun (bond-label defect, job 6218549). ====
+%% Non-bonded pairs were stored as ALL-ZERO vectors rather than one-hot on 'no bond', so the
+%% soft path gave that class zero loss and zero gradient and the model generated complete
+%% graphs. The hard arms argmax the target and are unaffected. DO NOT SUBMIT the claim below
+%% that soft categorical targets destroy the bond graph until the rerun lands.
 \paragraph{The Sinkhorn failure is in the bond graph, not the geometry.}
 A zero validity score reports only that the molecular graph is unusable, so it is worth asking
 whether the coordinates collapsed as well. They did not. The Sinkhorn samples have a median radius
@@ -248,6 +253,11 @@ nearest-neighbour distance of $1.13$~\AA{}, which is an ordinary bond length. Th
 therefore of roughly the right size and their atoms are appropriately spaced; what is wrong is the
 predicted bond graph.
 
+%% ==== PENDING: the Sinkhorn arm is being rerun (bond-label defect, job 6218549). ====
+%% Non-bonded pairs were stored as ALL-ZERO vectors rather than one-hot on 'no bond', so the
+%% soft path gave that class zero loss and zero gradient and the model generated complete
+%% graphs. The hard arms argmax the target and are unaffected. DO NOT SUBMIT the claim below
+%% that soft categorical targets destroy the bond graph until the rerun lands.
 \paragraph{Isolating the categorical channel.}
 Since permutation averaging changes both the coordinate target and the categorical targets, we ran
 one further ablation, \textbf{Sinkhorn-HC}, in which the doubly stochastic matrix is applied to the
@@ -300,6 +310,11 @@ early part of the simulated flow is driven by a network trained to point at the 
 Neither approximation to permutation averaging improved on hard Hungarian alignment, and the
 deterministic one failed outright. Three explanations account for what we observe.
 
+%% ==== PENDING: the Sinkhorn arm is being rerun (bond-label defect, job 6218549). ====
+%% Non-bonded pairs were stored as ALL-ZERO vectors rather than one-hot on 'no bond', so the
+%% soft path gave that class zero loss and zero gradient and the model generated complete
+%% graphs. The hard arms argmax the target and are unaffected. DO NOT SUBMIT the claim below
+%% that soft categorical targets destroy the bond graph until the rerun lands.
 \paragraph{The cost matrix ignores the discrete domain.}
 The cost $C_{ij} = \|(x_t)_i - t z_j\|^2$ is purely geometric, so a carbon paired with a hydrogen
 is considered exactly as good as a carbon paired with a carbon at the same distance. Under hard
