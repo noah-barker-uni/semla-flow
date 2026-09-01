@@ -229,6 +229,11 @@ def main(args):
 
     dataset_path = Path(args.data_path) / _SPLIT_FILES[args.dataset_split]
     dataset = GeometricDataset.load(dataset_path, transform=transform)
+
+    # Seed BEFORE sampling the molecules, not just before each row's noise draws. Without this the
+    # subset differs between invocations and the reported numbers move by a percent or two, which
+    # is invisible unless you happen to rerun with a different --times list and compare.
+    torch.manual_seed(args.seed)
     dataset = dataset.sample(min(args.n_molecules, len(dataset)), replacement=False)
     mols = [dataset[i] for i in range(len(dataset))]
 
