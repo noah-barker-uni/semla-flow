@@ -281,6 +281,53 @@ Its validity is nonetheless the higher of the two, $0.950$ against $0.918$, so t
 these two arms in the opposite order to the 3D ones. An evaluation using validity and stability
 alone would have concluded that Sinkhorn-HC was the better configuration.
 
+\paragraph{The averaged target collapses towards the origin at low $t$.}
+The three arms above differ only in the target they are trained against, so it is worth measuring
+that target directly. Table~\ref{tab:target-collapse} does so on real QM9 molecules with no model
+involved at all: it reports the plan $\bar{P}$ that the Sinkhorn arm would use at each $t$, and what
+it does to the label.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcccccccc}
+\hline
+$t$ & 0.05 & 0.10 & 0.20 & 0.30 & 0.50 & 0.70 & 0.90 & 0.95 \\
+\hline
+$\|\bar{P}z\| \,/\, \|z\|$              & 0.043 & 0.091 & 0.200 & 0.328 & 0.622 & 0.868 & 0.987 & 0.994 \\
+Effective atoms averaged, $n_{\text{eff}}$ & 17.3 & 17.0 & 15.8 & 13.5 & 7.5 & 3.1 & 1.25 & 1.14 \\
+Normalised plan entropy                 & 0.999 & 0.996 & 0.982 & 0.951 & 0.804 & 0.504 & 0.128 & 0.079 \\
+\hline
+\end{tabular}
+\caption{The Sinkhorn target measured on real QM9 molecules, averaged over $64$ molecules and $64$
+noise draws. The first row is the mean per-atom distance of the target from the origin divided by
+the same quantity for the unmodified data molecule. The second is
+$n_{\text{eff}} = 1 / \sum_j \bar{P}_{ij}^2$, the effective number of data atoms contributing to
+each row of the target: it equals $1$ for a one-hot row, $n$ for a uniform row, and $k$ for a row
+spread evenly over $k$ atoms. Equivalently it is the effective sample size of the weighted average,
+since averaging independent quantities with weights $p$ scales their variance by $\sum_j p_j^2$.
+The third row is the Shannon entropy of a row of $\bar{P}$ divided by $\log N$. For the Hungarian
+and Metropolis arms the first row is exactly $1$ and $n_{\text{eff}}$ exactly $1$ at every $t$,
+since both apply a genuine permutation.}
+\label{tab:target-collapse}
+\end{table}
+
+The behaviour at the two ends of the flow is what Section~\ref{sec:sinkhorn-approx} predicts, and in
+that sense the approximation is working as designed: the plan is near-uniform at $t \to 0$ and
+concentrates on a single permutation as $t \to 1$. The difficulty is what this implies in between.
+At $t = 0.05$ the target for each atom is an average of more than seventeen of the eighteen atoms in
+a typical QM9 molecule, which is the molecular centroid; and since these molecules are centred at
+the origin, that centroid \emph{is} the origin. Over the low-$t$ half of every trajectory the model
+is therefore regressed towards a label of approximately zero.
+
+It is worth being precise about what this does and does not explain. It is not a bug: it is what
+the posterior of Equation~\eqref{eq:permutation-posterior} says, since at small $t$ the interpolant
+genuinely carries almost no information about which permutation produced it. Nor does it show up as
+collapsed samples --- the generated molecules have a normal radius of gyration, as reported above.
+What it does mean is that the averaged target is uninformative over a large part of the flow, while
+the endpoint prediction is converted to a vector field by
+Equation~\eqref{eq:endpoint-to-vector-field} and used at every $t$ during sampling.
+
 \subsection{Discussion}
 
 Neither approximation to permutation averaging improved on hard Hungarian alignment, and the

@@ -144,12 +144,24 @@ def variance_summary(targets, states, mask, data_coords=None, diagnostics=None):
         )
 
     if diagnostics:
-        sums = [d["sinkhorn/sum_p_squared"].mean().item() for d in diagnostics if "sinkhorn/sum_p_squared" in d]
-        ents = [d["sinkhorn/plan_entropy"].mean().item() for d in diagnostics if "sinkhorn/plan_entropy" in d]
+        # sum_p_squared is already per MOLECULE (mean over that molecule's rows), so invert before
+        # averaging over molecules rather than after: n_eff is a per-molecule quantity and
+        # mean(1/s) != 1/mean(s). The earlier version collapsed the batch first, which is why the
+        # number moved slightly when this was corrected.
+        sums = [d["sinkhorn/sum_p_squared"] for d in diagnostics if "sinkhorn/sum_p_squared" in d]
+        ents = [d["sinkhorn/plan_entropy"] for d in diagnostics if "sinkhorn/plan_entropy" in d]
         if sums:
-            summary["eff_atoms"] = float(np.mean([1.0 / s for s in sums]))
+            stacked = torch.stack(sums).to(targets.dtype)              # [draws, batch]
+            n_real_per_mol = mask.sum(dim=1).to(targets.dtype).clamp_min(1.0)
+            summary["eff_atoms"] = float((1.0 / stacked).mean().item())
+
+            # The size-free version: what FRACTION of its own molecule each target row averages.
+            # n_eff alone is not comparable across molecules of different sizes -- 17 atoms is the
+            # whole of a QM9 molecule but half of a GEOM-Drugs one -- so this is the number to
+            # report when molecules vary in size.
+            summary["eff_atoms_frac"] = float((1.0 / (stacked * n_real_per_mol)).mean().item())
         if ents:
-            summary["plan_entropy"] = float(np.mean(ents))
+            summary["plan_entropy"] = float(torch.stack(ents).mean().item())
 
     return summary
 
@@ -183,7 +195,7 @@ def print_rows(rows):
     print()
     header = (
         f"{'coupling':<11}{'target':<10}{'t':>5}{'tgt var':>10}{'disp var':>10}"
-        f"{'||tgt||':>10}{'||x1||':>10}{'ratio':>10}{'eff atoms':>10}{'plan H':>10}"
+        f"{'||tgt||':>10}{'||x1||':>10}{'ratio':>10}{'eff atoms':>10}{'eff/N':>10}{'plan H':>10}"
     )
     print(header)
     print("-" * len(header))
@@ -192,7 +204,7 @@ def print_rows(rows):
             f"{row['coupling']:<11}{row['target']:<10}{row['t']:>5.2f}"
             f"{fmt(row.get('target_variance'))}{fmt(row.get('displacement_variance'))}"
             f"{fmt(row.get('target_norm'))}{fmt(row.get('data_norm'))}{fmt(row.get('norm_ratio'))}"
-            f"{fmt(row.get('eff_atoms'))}{fmt(row.get('plan_entropy'))}"
+            f"{fmt(row.get('eff_atoms'))}{fmt(row.get('eff_atoms_frac'))}{fmt(row.get('plan_entropy'))}"
         )
 
     print()
