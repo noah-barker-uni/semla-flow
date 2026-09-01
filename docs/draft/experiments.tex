@@ -294,30 +294,29 @@ it does to the label.
 \hline
 $t$ & 0.05 & 0.10 & 0.20 & 0.30 & 0.50 & 0.70 & 0.90 & 0.95 \\
 \hline
-$\|\bar{P}z\| \,/\, \|z\|$              & 0.043 & 0.091 & 0.200 & 0.328 & 0.622 & 0.868 & 0.987 & 0.994 \\
-Effective atoms averaged, $n_{\text{eff}}$ & 17.3 & 17.0 & 15.8 & 13.5 & 7.5 & 3.1 & 1.25 & 1.14 \\
-Normalised plan entropy                 & 0.999 & 0.996 & 0.982 & 0.951 & 0.804 & 0.504 & 0.128 & 0.079 \\
+$\|\bar{P}z\| \,/\, \|z\|$   & 0.044 & 0.092 & 0.203 & 0.333 & 0.629 & 0.870 & 0.987 & 0.993 \\
+$n_{\text{eff}} / N$         & 0.995 & 0.979 & 0.906 & 0.776 & 0.433 & 0.179 & 0.073 & 0.066 \\
 \hline
 \end{tabular}
-\caption{The Sinkhorn target measured on real QM9 molecules, averaged over $64$ molecules and $64$
-noise draws. The first row is the mean per-atom distance of the target from the origin divided by
-the same quantity for the unmodified data molecule. The second is
-$n_{\text{eff}} = 1 / \sum_j \bar{P}_{ij}^2$, the effective number of data atoms contributing to
-each row of the target: it equals $1$ for a one-hot row, $n$ for a uniform row, and $k$ for a row
-spread evenly over $k$ atoms. Equivalently it is the effective sample size of the weighted average,
-since averaging independent quantities with weights $p$ scales their variance by $\sum_j p_j^2$.
-The third row is the Shannon entropy of a row of $\bar{P}$ divided by $\log N$. For the Hungarian
-and Metropolis arms the first row is exactly $1$ and $n_{\text{eff}}$ exactly $1$ at every $t$,
-since both apply a genuine permutation.}
+\caption{The Sinkhorn target measured on real QM9 molecules, over $256$ molecules and $64$ noise
+draws per value of $t$. The first row is the mean per-atom distance of the target from the origin,
+divided by the same quantity for the unmodified data molecule, so it is $1$ when the target is the
+molecule itself and $0$ when the target is the origin. The second is the fraction of its own
+molecule that each row of the target averages over,
+$n_{\text{eff}} / N$ with $n_{\text{eff}} = 1 / \sum_j \bar{P}_{ij}^2$: this equals $1/N$ when the
+row is a one-hot on a single atom and $1$ when it is uniform over the whole molecule. It is
+reported as a fraction rather than as a count of atoms because $N$ varies between molecules, so a
+raw count would not be comparable across a dataset. For the Hungarian and Metropolis arms both rows
+are exactly $1$ and $1/N$ respectively at every $t$, since both apply a genuine permutation.}
 \label{tab:target-collapse}
 \end{table}
 
 The behaviour at the two ends of the flow is what Section~\ref{sec:sinkhorn-approx} predicts, and in
 that sense the approximation is working as designed: the plan is near-uniform at $t \to 0$ and
 concentrates on a single permutation as $t \to 1$. The difficulty is what this implies in between.
-At $t = 0.05$ the target for each atom is an average of more than seventeen of the eighteen atoms in
-a typical QM9 molecule, which is the molecular centroid; and since these molecules are centred at
-the origin, that centroid \emph{is} the origin. Over the low-$t$ half of every trajectory the model
+At $t = 0.05$ each row of the target averages over $99.5\%$ of its own molecule, which is to say the
+molecular centroid; and since these molecules are centred at the origin, that centroid \emph{is} the
+origin. Even at $t = 0.3$ the figure is still $78\%$. Over the low-$t$ half of every trajectory the model
 is therefore regressed towards a label of approximately zero.
 
 It is worth being precise about what this does and does not explain. It is not a bug: it is what

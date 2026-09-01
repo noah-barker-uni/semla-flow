@@ -181,12 +181,13 @@ def render_markdown(summary: dict) -> str:
         lines += ["", "## Target collapse against t (no model involved)", "",
                   "ratio = ||P x1|| / ||x1||. The plan going uniform makes the target the molecular",
                   "centroid, which is the ORIGIN for zero-COM molecules -- so the label is all zeros.", "",
-                  "| coupling | target | t | ratio | eff atoms averaged | plan entropy | disp var |",
-                  "|---|---|---|---|---|---|---|"]
+                  "| coupling | target | t | ratio | eff atoms | eff/N | plan entropy | disp var |",
+                  "|---|---|---|---|---|---|---|---|"]
         for row in collapse.get("rows", []):
             lines.append(
                 f"| {row['coupling']} | {row['target']} | {_fmt(row['t'], '.2f')} "
                 f"| {_fmt(row.get('norm_ratio'))} | {_fmt(row.get('eff_atoms'))} "
+                f"| {_fmt(row.get('eff_atoms_frac'))} "
                 f"| {_fmt(row.get('plan_entropy'))} | {_fmt(row.get('displacement_variance'))} |"
             )
 
